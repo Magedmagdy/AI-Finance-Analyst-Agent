@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import json
 import os
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -36,6 +38,21 @@ ALLOWED_METRICS = {
     "active_accounts",
     "average_transaction_amount",
 }
+
+MONETARY_METRICS = {
+    "total_inflows", "total_outflows", "net_cash_flow", "fees", "refunds", "transfers",
+}
+COUNT_METRICS = {
+    "transactions", "completed_transactions", "pending_transactions",
+    "failed_transactions", "reversed_transactions", "active_accounts",
+}
+METRIC_DEFINITION_VERSION = "ai_finance_metrics_v1"
+FORECAST_MODEL_VERSION = "trailing_moving_average_v1"
+FORECAST_TABLE = "mart.financial_forecasts"
+
+
+class DuplicateForecastError(Exception):
+    """Raised when a generated forecast identifier already exists."""
 
 CURRENCY_ALIASES = {
     "$": "USD",
@@ -148,16 +165,50 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
     "forecast_financial_kpi": {
         "name": "forecast_financial_kpi",
-        "description": "Forecast the next monthly KPI using a trailing moving average of completed monthly periods.",
+        "description": "Calculate a non-persisted monthly KPI forecast using completed observations ending on or before an inclusive historical cutoff.",
         "parameters": {
             "type": "object",
             "properties": {
                 "currency": {"type": "string", "description": "Currency code."},
                 "metric": {"type": "string", "description": "Metric to forecast."},
-                "forecast_period": {"type": "string", "description": "Target month YYYY-MM-DD, usually the first day of the month."},
+                "forecast_period": {"type": "string", "description": "Target month start in YYYY-MM-01 format."},
                 "lookback_months": {"type": "integer", "description": "Number of trailing completed months, default 3."},
+                "historical_cutoff": {"type": "string", "description": "Inclusive as-of date YYYY-MM-DD. Only complete months ending on or before this date may be used."},
             },
-            "required": ["currency", "metric", "forecast_period"],
+            "required": ["currency", "metric", "forecast_period", "historical_cutoff"],
+        },
+    },
+    "save_financial_forecast": {
+        "name": "save_financial_forecast",
+        "description": "Calculate a cutoff-safe monthly forecast and persist it. Returns persisted=true only after the database commit succeeds.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "currency": {"type": "string", "description": "Currency code."},
+                "metric": {"type": "string", "description": "Metric to forecast."},
+                "forecast_period": {"type": "string", "description": "Target month start YYYY-MM-01."},
+                "historical_cutoff": {"type": "string", "description": "Inclusive historical cutoff YYYY-MM-DD."},
+                "lookback_months": {"type": "integer", "description": "Number of completed monthly observations; default 3."},
+            },
+            "required": ["currency", "metric", "forecast_period", "historical_cutoff"],
+        },
+    },
+    "get_saved_financial_forecast": {
+        "name": "get_saved_financial_forecast",
+        "description": "Retrieve one persisted forecast by its unique forecast ID.",
+        "parameters": {
+            "type": "object",
+            "properties": {"forecast_id": {"type": "string", "description": "Unique forecast identifier returned when saving."}},
+            "required": ["forecast_id"],
+        },
+    },
+    "compare_saved_forecast_to_actual": {
+        "name": "compare_saved_forecast_to_actual",
+        "description": "Compare a saved monthly forecast with its actual value for the same metric, currency, unit definition, grain, and target month.",
+        "parameters": {
+            "type": "object",
+            "properties": {"forecast_id": {"type": "string", "description": "Unique forecast identifier returned when saving."}},
+            "required": ["forecast_id"],
         },
     },
     "analyze_financial_ratios": {
@@ -958,6 +1009,37 @@ def _authoritative_net_cash_flow(
     return _safe_float(row.get("value")) if row else None
 
 
+def _authoritative_cash_flow_metrics(
+    currency: str,
+    period_from: str,
+    period_to: str,
+) -> Dict[str, Optional[float]]:
+    """Read the authoritative monthly cash-flow measures for one currency/period."""
+    row = _query_one(
+        """
+        SELECT
+            COUNT_BIG(*) AS observation_count,
+            SUM(total_inflows) AS total_inflows,
+            SUM(total_outflows) AS total_outflows,
+            SUM(net_cash_flow) AS net_cash_flow,
+            SUM(fees) AS fees,
+            SUM(refunds) AS refunds
+        FROM mart.daily_financial_kpis
+        WHERE currency = ?
+          AND business_date >= ?
+          AND business_date <= ?;
+        """,
+        (currency, period_from, period_to),
+    )
+    metric_names = ("total_inflows", "total_outflows", "net_cash_flow", "fees", "refunds")
+    if not row or _safe_int(row.get("observation_count")) == 0:
+        return {metric: None for metric in metric_names}
+    return {
+        metric: _safe_float(row.get(metric)) if row.get(metric) is not None else None
+        for metric in metric_names
+    }
+
+
 def analyze_cash_flow_drivers(
     currency: str,
     period_1_from: str,
@@ -988,8 +1070,10 @@ def analyze_cash_flow_drivers(
     rows1 = _driver_query(currency, period_1_from, period_1_to)
     rows2 = _driver_query(currency, period_2_from, period_2_to)
 
-    authoritative_1 = _authoritative_net_cash_flow(currency, period_1_from, period_1_to)
-    authoritative_2 = _authoritative_net_cash_flow(currency, period_2_from, period_2_to)
+    kpis_1 = _authoritative_cash_flow_metrics(currency, period_1_from, period_1_to)
+    kpis_2 = _authoritative_cash_flow_metrics(currency, period_2_from, period_2_to)
+    authoritative_1 = kpis_1.get("net_cash_flow")
+    authoritative_2 = kpis_2.get("net_cash_flow")
 
     if authoritative_1 is None or authoritative_2 is None:
         return {
@@ -1012,6 +1096,54 @@ def analyze_cash_flow_drivers(
     period_2_value = authoritative_2
     absolute_change = period_2_value - period_1_value
     percentage_change = None if period_1_value == 0 else (absolute_change / abs(period_1_value)) * 100
+
+    component_comparisons = []
+    for metric in ("net_cash_flow", "total_inflows", "total_outflows", "fees", "refunds"):
+        value_1 = kpis_1.get(metric)
+        value_2 = kpis_2.get(metric)
+        available = value_1 is not None and value_2 is not None
+        change = value_2 - value_1 if available else None
+        component_comparisons.append(
+            {
+                "metric": metric,
+                "currency": currency,
+                "source": "AI_Finance.mart.daily_financial_kpis",
+                "period_1": {
+                    "date_from": period_1_from,
+                    "date_to": period_1_to,
+                    "value": value_1,
+                },
+                "period_2": {
+                    "date_from": period_2_from,
+                    "date_to": period_2_to,
+                    "value": value_2,
+                },
+                "period_1_value": value_1,
+                "period_2_value": value_2,
+                "absolute_change": change,
+                "percentage_change": (
+                    None if not available or value_1 == 0 else (change / abs(value_1)) * 100
+                ),
+                "status": "success" if available else "no_data",
+            }
+        )
+
+    flow_reconciliation = {}
+    for label, values in (("period_1", kpis_1), ("period_2", kpis_2)):
+        inflows = values.get("total_inflows")
+        outflows = values.get("total_outflows")
+        net = values.get("net_cash_flow")
+        if inflows is None or outflows is None or net is None:
+            flow_reconciliation[label] = {"status": "unavailable"}
+            continue
+        calculated_net = inflows - outflows
+        gap = calculated_net - net
+        flow_reconciliation[label] = {
+            "calculated_net_from_flows": calculated_net,
+            "reported_net_cash_flow": net,
+            "gap": gap,
+            "status": "reconciled" if math.isclose(calculated_net, net, abs_tol=0.01, rel_tol=1e-9) else "not_reconciled",
+        }
 
     drivers: List[Dict[str, Any]] = []
     for tx_type in all_types:
@@ -1060,6 +1192,12 @@ def analyze_cash_flow_drivers(
         "period_2": {"date_from": period_2_from, "date_to": period_2_to, "value": period_2_value},
         "absolute_change": absolute_change,
         "percentage_change": percentage_change,
+        "cash_flow_metric_comparisons": component_comparisons,
+        "flow_reconciliation": flow_reconciliation,
+        "metric_relationships": {
+            "fees": "Reported separately; analyzed as fees / total_outflows. Do not add fees to total_outflows.",
+            "refunds": "Reported separately; analyzed as refunds / total_inflows. Do not add refunds to total_inflows.",
+        },
         "drivers": drivers,
         "drivers_by_currency": {currency: drivers},
         "top_drivers_by_currency": {currency: top_drivers},
@@ -1090,6 +1228,7 @@ def analyze_cash_flow_drivers(
             "read_only": True,
             "authoritative_net_cash_flow_source": "AI_Finance.mart.daily_financial_kpis",
             "driver_component_source": "AI_Finance.core.vw_transactions",
+            "cash_flow_metric_source": "AI_Finance.mart.daily_financial_kpis",
             "mixed_scope_is_explicit": True,
         },
     }
@@ -1123,12 +1262,18 @@ def forecast_financial_kpi(
     currency: str,
     metric: str,
     forecast_period: str,
+    historical_cutoff: str,
     lookback_months: int = 3,
 ) -> Dict[str, Any]:
     currency = _validate_currency(currency)
     metric = _validate_metric(metric)
     forecast_date = _parse_date(forecast_period)
+    cutoff_date = _parse_date(historical_cutoff)
+    if forecast_date.day != 1:
+        raise ValueError("forecast_period must be the first day of the target month (YYYY-MM-01).")
     forecast_month = _month_start(forecast_date)
+    if cutoff_date >= forecast_month:
+        raise ValueError("historical_cutoff must be before the target forecast month.")
 
     if lookback_months < 1 or lookback_months > 24:
         raise ValueError("lookback_months must be between 1 and 24")
@@ -1136,20 +1281,38 @@ def forecast_financial_kpi(
     coverage = get_financial_data_coverage()
     latest_actual_text = coverage.get("available_data", {}).get("date_to")
     if not latest_actual_text:
-        return {"status": "no_data", "currency": currency, "metric": metric}
+        return {
+            "status": "no_data", "currency": currency, "metric": metric,
+            "forecast_period": forecast_month.isoformat(),
+            "historical_cutoff": cutoff_date.isoformat(),
+            "lookback_months": lookback_months, "grain": "monthly",
+            "is_forecast": True, "persisted": False,
+            "message": "No actual data is available for the requested forecast.",
+        }
 
     latest_actual = _parse_date(latest_actual_text)
-    last_actual_month = _month_start(latest_actual)
+    eligible_through = min(cutoff_date, latest_actual)
+    last_complete_month = _month_start(eligible_through)
+    if eligible_through < _month_end(last_complete_month):
+        if last_complete_month == date.min.replace(day=1):
+            last_complete_month = None
+        else:
+            last_complete_month = _add_months(last_complete_month, -1)
 
-    if forecast_month <= last_actual_month:
-        forecast_month = _add_months(last_actual_month, 1)
-
-    history = _forecast_monthly_values(
-        currency=currency,
-        metric=metric,
-        end_month=last_actual_month,
-        lookback_months=lookback_months,
+    history = (
+        _forecast_monthly_values(
+            currency=currency,
+            metric=metric,
+            end_month=last_complete_month,
+            lookback_months=lookback_months,
+        )
+        if last_complete_month is not None
+        else []
     )
+    history = [
+        item for item in history
+        if str(item.get("period", "")) <= last_complete_month.strftime("%Y-%m")
+    ]
 
     if len(history) < lookback_months:
         return {
@@ -1157,10 +1320,14 @@ def forecast_financial_kpi(
             "currency": currency,
             "metric": metric,
             "forecast_period": forecast_month.isoformat(),
+            "historical_cutoff": cutoff_date.isoformat(),
             "lookback_months": lookback_months,
             "historical_periods": history,
+            "grain": "monthly",
+            "is_forecast": True,
+            "persisted": False,
             "available_data": coverage.get("available_data"),
-            "message": "Not enough completed monthly observations are available for the requested lookback window.",
+            "message": "Not enough completed monthly observations are available on or before the historical cutoff.",
         }
 
     values = [_safe_float(item.get("value")) for item in history[-lookback_months:]]
@@ -1171,14 +1338,23 @@ def forecast_financial_kpi(
         "currency": currency,
         "metric": metric,
         "forecast_period": forecast_month.isoformat(),
+        "historical_cutoff": cutoff_date.isoformat(),
         "forecast_value": forecast_value,
         "method": "Trailing Moving Average",
+        "grain": "monthly",
         "lookback_months": lookback_months,
+        "lookback_window": {
+            "from": history[-lookback_months]["period"],
+            "through": history[-1]["period"],
+            "observation_count": len(history[-lookback_months:]),
+        },
         "is_forecast": True,
+        "persisted": False,
+        "message": "Forecast calculated from completed historical monthly observations; it has not been saved.",
         "historical_periods": history[-lookback_months:],
         "source_periods": [x["period"] for x in history[-lookback_months:]],
         "source_values": values,
-        "last_actual_period": last_actual_month.isoformat(),
+        "last_actual_period": last_complete_month.isoformat(),
         "calculation": {
             "formula": f"sum(last_{lookback_months}_completed_months) / {lookback_months}"
         },
@@ -1186,7 +1362,317 @@ def forecast_financial_kpi(
             "actual_history": True,
             "forecast_is_not_actual": True,
             "latest_actual_date": latest_actual_text,
+            "no_data_after_historical_cutoff_used": True,
         },
+    }
+
+
+def _metric_unit(metric: str, currency: str) -> str:
+    if metric in MONETARY_METRICS:
+        return currency
+    if metric == "average_transaction_amount":
+        return f"{currency}/transaction"
+    if metric in COUNT_METRICS:
+        return "count"
+    raise ValueError(f"No unit definition is available for metric: {metric}")
+
+
+def _insert_forecast_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert a forecast record and return DB-confirmed metadata after commit."""
+    conn = get_sql_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT INTO {FORECAST_TABLE} (
+                forecast_id, metric, currency, target_period, time_grain, unit,
+                forecast_value, forecast_method, lookback_months, historical_cutoff,
+                source_periods_json, source_values_json, model_version,
+                metric_definition_version, status, provenance_json
+            )
+            OUTPUT INSERTED.forecast_id, INSERTED.created_at
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                record["forecast_id"], record["metric"], record["currency"],
+                record["target_period"], record["time_grain"], record["unit"],
+                record["forecast_value"], record["forecast_method"], record["lookback_months"],
+                record["historical_cutoff"], record["source_periods_json"],
+                record["source_values_json"], record["model_version"],
+                record["metric_definition_version"], record["status"], record["provenance_json"],
+            ),
+        )
+        inserted = cursor.fetchone()
+        if inserted is None:
+            raise RuntimeError("The database did not confirm the forecast insert.")
+        conn.commit()
+        return {"forecast_id": str(inserted[0]), "created_at": inserted[1]}
+    except Exception as exc:
+        conn.rollback()
+        message = str(exc).lower()
+        if "2627" in message or "2601" in message or "duplicate key" in message:
+            raise DuplicateForecastError("Forecast identifier already exists.") from None
+        raise
+    finally:
+        conn.close()
+
+
+def _select_forecast_record(forecast_id: str) -> Optional[Dict[str, Any]]:
+    return _query_one(
+        f"""
+        SELECT forecast_id, metric, currency, target_period, time_grain, unit,
+               forecast_value, forecast_method, lookback_months, historical_cutoff,
+               source_periods_json, source_values_json, model_version,
+               metric_definition_version, status, provenance_json, created_at
+        FROM {FORECAST_TABLE}
+        WHERE forecast_id = ?;
+        """,
+        (forecast_id,),
+    )
+
+
+def save_financial_forecast(
+    currency: str,
+    metric: str,
+    forecast_period: str,
+    historical_cutoff: str,
+    lookback_months: int = 3,
+) -> Dict[str, Any]:
+    """Calculate and persist a forecast; never reports saved before commit."""
+    calculated = forecast_financial_kpi(
+        currency=currency,
+        metric=metric,
+        forecast_period=forecast_period,
+        historical_cutoff=historical_cutoff,
+        lookback_months=lookback_months,
+    )
+    if calculated.get("status") != "success":
+        return {**calculated, "persisted": False, "message": calculated.get("message", "Forecast could not be calculated.")}
+
+    currency = _validate_currency(calculated["currency"])
+    metric = _validate_metric(calculated["metric"])
+    forecast_value = float(calculated["forecast_value"])
+    if not math.isfinite(forecast_value):
+        return {
+            **calculated,
+            "status": "save_failed",
+            "persisted": False,
+            "message": "Forecast value is not a finite number and cannot be saved.",
+        }
+    lookback_months = int(calculated["lookback_months"])
+    if not 1 <= lookback_months <= 24:
+        return {
+            **calculated,
+            "status": "save_failed",
+            "persisted": False,
+            "message": "Forecast lookback configuration is invalid and cannot be saved.",
+        }
+    record = {
+        "forecast_id": str(uuid.uuid4()),
+        "metric": metric,
+        "currency": currency,
+        "target_period": calculated["forecast_period"],
+        "time_grain": calculated["grain"],
+        "unit": _metric_unit(metric, currency),
+        "forecast_value": forecast_value,
+        "forecast_method": calculated["method"],
+        "lookback_months": lookback_months,
+        "historical_cutoff": calculated["historical_cutoff"],
+        "source_periods_json": json.dumps(calculated["source_periods"]),
+        "source_values_json": json.dumps(calculated["source_values"]),
+        "model_version": FORECAST_MODEL_VERSION,
+        "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "status": "saved",
+        "provenance_json": json.dumps({
+            "source": "verified_actuals",
+            "calculation": calculated["calculation"],
+            "forecast_is_not_actual": True,
+        }),
+    }
+
+    try:
+        confirmation = _insert_forecast_record(record)
+    except DuplicateForecastError:
+        return {
+            **calculated,
+            "status": "duplicate_id",
+            "persisted": False,
+            "message": "The forecast identifier already exists; no existing record was overwritten.",
+        }
+    except Exception:
+        return {
+            **calculated,
+            "status": "save_failed",
+            "persisted": False,
+            "message": "Forecast calculation succeeded, but persistent storage is unavailable or the forecast schema is not installed.",
+        }
+
+    return {
+        **calculated,
+        "status": "saved",
+        "forecast_id": confirmation["forecast_id"],
+        "created_at": confirmation["created_at"].isoformat()
+        if hasattr(confirmation["created_at"], "isoformat")
+        else str(confirmation["created_at"]),
+        "model_version": FORECAST_MODEL_VERSION,
+        "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "unit": record["unit"],
+        "persisted": True,
+        "message": "Forecast calculated and saved successfully.",
+    }
+
+
+def get_saved_financial_forecast(forecast_id: str) -> Dict[str, Any]:
+    try:
+        normalized_id = str(uuid.UUID(str(forecast_id)))
+    except (ValueError, TypeError, AttributeError):
+        return {"status": "invalid_forecast_id", "message": "A valid forecast ID is required."}
+    try:
+        row = _select_forecast_record(normalized_id)
+    except Exception:
+        return {"status": "retrieval_failed", "message": "Forecast storage is unavailable or the forecast schema is not installed."}
+    if row is None:
+        return {"status": "forecast_not_found", "forecast_id": normalized_id, "message": "No saved forecast was found for this ID."}
+
+    result = dict(row)
+    result["forecast_id"] = str(result["forecast_id"])
+    for field in ("target_period", "historical_cutoff", "created_at"):
+        if hasattr(result.get(field), "isoformat"):
+            result[field] = result[field].isoformat()
+    for field, destination in (("source_periods_json", "source_periods"), ("source_values_json", "source_values"), ("provenance_json", "provenance")):
+        try:
+            result[destination] = json.loads(result.pop(field))
+        except (TypeError, json.JSONDecodeError):
+            return {"status": "retrieval_failed", "forecast_id": normalized_id, "message": "Saved forecast metadata is invalid."}
+    result["status"] = "success"
+    result["persisted"] = True
+    result["forecast_value"] = _safe_float(result["forecast_value"])
+    return result
+
+
+def _has_actual_observations(metric: str, currency: str, date_from: str, date_to: str) -> bool:
+    """Distinguish a recorded zero from an absent source period."""
+    if metric in {"transactions", "active_accounts", "average_transaction_amount"}:
+        row = _query_one(
+            """
+            SELECT COUNT_BIG(*) AS observation_count
+            FROM core.vw_transactions
+            WHERE currency = ?
+              AND transaction_timestamp >= ?
+              AND transaction_timestamp < DATEADD(day, 1, ?);
+            """,
+            (currency, date_from, date_to),
+        )
+    else:
+        row = _query_one(
+            """
+            SELECT COUNT_BIG(*) AS observation_count
+            FROM mart.daily_financial_kpis
+            WHERE currency = ?
+              AND business_date >= ?
+              AND business_date <= ?;
+            """,
+            (currency, date_from, date_to),
+        )
+    return bool(row and _safe_int(row.get("observation_count")) > 0)
+
+
+def compare_saved_forecast_to_actual(forecast_id: str) -> Dict[str, Any]:
+    saved = get_saved_financial_forecast(forecast_id)
+    if saved.get("status") != "success":
+        return {
+            "status": saved.get("status", "retrieval_failed"),
+            "forecast_id": saved.get("forecast_id"),
+            "message": saved.get("message", "Saved forecast could not be retrieved."),
+        }
+
+    metric = _validate_metric(saved["metric"])
+    currency = _validate_currency(saved["currency"])
+    period = _parse_date(saved["target_period"])
+    if saved.get("time_grain") != "monthly" or period.day != 1:
+        return {"status": "comparison_rejected", "forecast_id": saved["forecast_id"], "message": "Only first-of-month monthly forecasts can be compared."}
+    expected_unit = _metric_unit(metric, currency)
+    if saved.get("unit") != expected_unit or saved.get("metric_definition_version") != METRIC_DEFINITION_VERSION:
+        return {"status": "comparison_rejected", "forecast_id": saved["forecast_id"], "message": "Forecast metric definition or unit does not match the current actual metric."}
+
+    period_start = period.isoformat()
+    period_end = _month_end(period).isoformat()
+    coverage = get_financial_data_coverage()
+    latest_actual = coverage.get("available_data", {}).get("date_to")
+    if not latest_actual or latest_actual < period_end:
+        return {
+            "status": "actual_not_found", "forecast_id": saved["forecast_id"],
+            "metric": metric, "currency": currency, "time_grain": saved["time_grain"],
+            "target_period": period_start,
+            "message": "A complete actual value for the forecast target month is not available.",
+        }
+
+    try:
+        source_has_observations = _has_actual_observations(metric, currency, period_start, period_end)
+    except Exception:
+        return {
+            "status": "actual_not_found", "forecast_id": saved["forecast_id"],
+            "metric": metric, "currency": currency, "time_grain": saved["time_grain"],
+            "target_period": period_start,
+            "message": "Actual source availability could not be verified for the forecast target month.",
+        }
+    if not source_has_observations:
+        return {
+            "status": "actual_not_found", "forecast_id": saved["forecast_id"],
+            "metric": metric, "currency": currency, "time_grain": saved["time_grain"],
+            "target_period": period_start,
+            "message": "No source observations are available for this metric, currency, and target month.",
+        }
+
+    actual_result = get_financial_kpis(
+        currency=currency, date_from=period_start, date_to=period_end, metric=metric,
+    )
+    if actual_result.get("status") != "success":
+        return {
+            "status": "actual_not_found", "forecast_id": saved["forecast_id"],
+            "metric": metric, "currency": currency, "time_grain": saved["time_grain"],
+            "target_period": period_start,
+            "message": "No matching actual value is available for the forecast target month and currency.",
+        }
+    expected_period = {"date_from": period_start, "date_to": period_end}
+    resolved_period = actual_result.get("resolved_period")
+    result_filters = actual_result.get("filters", {})
+    if resolved_period != expected_period or result_filters.get("currency") != currency:
+        return {
+            "status": "comparison_rejected", "forecast_id": saved["forecast_id"],
+            "message": "Actual currency or resolved period did not exactly match the saved forecast metadata.",
+        }
+    actual_rows = actual_result.get("results", [])
+    matching = [
+        row for row in actual_rows
+        if row.get("metric") == metric
+        and row.get("currency") == currency
+        and row.get("period") == expected_period
+    ]
+    if len(matching) != 1:
+        return {"status": "comparison_rejected", "forecast_id": saved["forecast_id"], "message": "Actual metric, currency, or period did not match the saved forecast."}
+
+    actual_value = _safe_float(matching[0]["value"])
+    forecast_value = _safe_float(saved["forecast_value"])
+    signed_difference = actual_value - forecast_value
+    absolute_error = abs(signed_difference)
+    percentage_error = None if actual_value == 0 else absolute_error / abs(actual_value) * 100
+    return {
+        "status": "comparison_success",
+        "forecast_id": saved["forecast_id"],
+        "metric": metric,
+        "currency": currency,
+        "unit": expected_unit,
+        "time_grain": saved["time_grain"],
+        "target_period": period_start,
+        "historical_cutoff": saved["historical_cutoff"],
+        "forecast_value": forecast_value,
+        "actual_value": actual_value,
+        "signed_difference": signed_difference,
+        "absolute_error": absolute_error,
+        "percentage_error": percentage_error,
+        "percentage_error_status": "unavailable_actual_is_zero" if actual_value == 0 else "available",
+        "message": "Percentage error is unavailable because actual is zero." if actual_value == 0 else "Forecast compared with the matching actual period.",
     }
 
 
@@ -1405,6 +1891,9 @@ TOOL_FUNCTIONS = {
     "detect_financial_anomalies": detect_financial_anomalies,
     "analyze_cash_flow_drivers": analyze_cash_flow_drivers,
     "forecast_financial_kpi": forecast_financial_kpi,
+    "save_financial_forecast": save_financial_forecast,
+    "get_saved_financial_forecast": get_saved_financial_forecast,
+    "compare_saved_forecast_to_actual": compare_saved_forecast_to_actual,
     "analyze_financial_ratios": analyze_financial_ratios,
 }
 

@@ -33,6 +33,8 @@ env/
 *.xls
 *.xlsb
 *.db
+*.sqlite
+*.sqlite3
 
 # ==========================================
 # ML Models
@@ -46,6 +48,16 @@ env/
 # ==========================================
 *.log
 logs/
+
+# Generated local demo recordings and capture frames
+/AI_Finance_Demo_Arabic_Cinematic_V3/
+/AI_Finance_Demo_Cinematic_V2/
+/AI_Finance_Demo_Final/
+/AI_Finance_Demo_Review/
+*.mp4
+*.mov
+*.mkv
+*.webm
 
 # ==========================================
 # OS

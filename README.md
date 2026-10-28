@@ -1,225 +1,190 @@
 # AI Finance Analyst Agent
 
-**An AI-powered financial analytics project combining data engineering, SQL Server, machine learning, APIs, and natural-language interaction.**
+An AI-assisted finance analysis application that answers natural-language questions using validated analytics against a SQL Server financial data mart. It combines a bilingual executive dashboard with a conversational analyst powered by Google Gemini and deterministic financial tools.
 
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/)
-[![SQL Server](https://img.shields.io/badge/Database-SQL%20Server-red)](https://www.microsoft.com/en-us/sql-server)
-[![AI](https://img.shields.io/badge/AI-Financial%20Analytics-purple)](https://github.com/Magedmagdy/AI-Finance-Analyst-Agent)
-[![Status](https://img.shields.io/badge/Status-Under%20Development-orange)](https://github.com/Magedmagdy/AI-Finance-Analyst-Agent)
+The repository is an evolving project. Results depend on the configured database, its available data, and the model response; this software is not audited financial advice.
 
-## Overview
+## Key Features
 
-The **AI Finance Analyst Agent** explores how AI can make financial data easier to query, analyze, and interpret.
+- **Executive dashboard:** currency and period filters, financial KPIs, monthly trends, period comparisons, cash-flow drivers, anomaly analysis, financial ratios, and a forecast outlook.
+- **Natural-language Copilot:** asks the configured Gemini model to select from the enabled financial tools; tool results are validated before they are used in the response.
+- **English and Arabic UI:** includes right-to-left layout, light and dark themes, and localized interface text.
+- **Data-grounded charts:** dashboard trends and eligible Copilot chart requests use values returned by the financial analytics tools and are drawn with inline SVG.
+- **Forecasting:** monthly forecasts use a trailing moving average and identify their historical basis. Forecasts can also be saved and compared with actuals through the SQL forecast table.
+- **Financial safeguards:** supported-currency validation, explicit separation of facts from interpretation, and checks against unsupported values and mixed-currency results.
 
-The project brings together a data-processing foundation, SQL Server integration, API and machine-learning components, and an AI-agent workflow intended to support finance-oriented questions and analytical tasks.
+Tool availability and results depend on the configured SQL Server schema and the underlying data. The application does not ship with a private financial dataset.
 
-The objective is to move beyond static reports toward a more interactive analytical experience—where users can ask questions in natural language and receive insights grounded in financial data.
+## How It Works
 
-> **Project status:** This repository is an evolving technical project. Component availability, configuration, and validation may vary. It is not presented as a production-ready financial system.
+1. The browser loads the FastAPI dashboard and sends chat questions to `POST /api/chat`.
+2. The route resolves session and language context, then calls `FinanceAgent`.
+3. The agent sends the question and enabled tool definitions to the configured Gemini model. The model may request a financial tool, and the agent normalizes and validates its arguments.
+4. Financial tools query the configured SQL Server data mart. The agent validates returned values and gives the model verified results for its explanation.
+5. The API returns the answer, session messages, and (when a verified trend result supports a chart request) chart metadata and points. The browser renders the chart as SVG.
 
-## Key Capabilities and Goals
+The dashboard also calls financial tools directly for its structured panels. Saving a forecast is a separate write operation to `mart.financial_forecasts`; it is not performed by the dashboard's ordinary analytics queries.
 
-- **Financial data engineering** — prepare and process transaction datasets for downstream analysis.
-- **SQL-based analytics** — connect analytical workflows to SQL Server data.
-- **Financial KPIs** — support the development of metrics and financial summaries.
-- **AI-assisted analysis** — explore natural-language interaction with financial information.
-- **Machine-learning integration** — provide a foundation for prediction and anomaly-analysis workflows.
-- **API architecture** — organize analytical capabilities behind service interfaces.
-- **Workflow orchestration** — explore connecting tools and agent workflows through n8n.
-- **Retrieval-Augmented Generation (RAG)** — explore grounding AI responses in relevant data or retrieved context.
-
-These capabilities describe the project's scope and direction; they should not be interpreted as a guarantee that every workflow is fully implemented, independently validated, or production-ready.
-
-## High-Level Architecture
+## Architecture
 
 ```mermaid
-flowchart TD
-    U["User / Finance Analyst"] --> A["AI Agent / Workflow"]
-    A --> SQL["SQL Analytics Tool"]
-    A --> API["API Layer"]
-    API --> ML["Machine Learning Components"]
-    SQL --> DB[("SQL Server")]
-    ML --> DATA["Processed Financial Data"]
-    DB --> RESULTS["Analytical Results"]
-    DATA --> RESULTS
-    RESULTS --> LLM["AI Interpretation"]
-    LLM --> RESPONSE["Natural-Language Response"]
+flowchart LR
+    Browser[Browser UI<br/>HTML · CSS · JavaScript · SVG] -->|HTTP| API[FastAPI web_app]
+    API --> Dashboard[Dashboard analytics]
+    API --> Agent[FinanceAgent]
+    Agent -->|question + tool definitions| Gemini[Google Gemini API]
+    Gemini -->|tool call / response| Agent
+    Agent --> Tools[Financial analytics tools]
+    Dashboard --> Tools
+    Tools --> SQL[(SQL Server data mart)]
+    Agent -->|answer + optional chart payload| API
+    API --> Browser
+    Tools -. forecast persistence .-> Forecast[(mart.financial_forecasts)]
 ```
-
-The diagram represents the intended high-level flow. The exact integration between components depends on their implementation and runtime configuration.
 
 ## Technology Stack
 
-| Area | Technologies |
+| Area | Technology |
 |---|---|
-| Programming | Python |
-| Data processing | pandas, NumPy, PyArrow |
-| Database | Microsoft SQL Server, pyodbc, SQLAlchemy |
-| Data exploration | Jupyter Notebook |
-| API layer | FastAPI-related project components |
-| AI and language models | LLM-based workflows |
-| Orchestration | n8n |
-| AI retrieval approach | RAG |
-| Configuration | Environment variables, `python-dotenv` |
-| Dataset access | Hugging Face dataset tooling |
+| Language | Python 3.11+ |
+| Web API and server-rendered page | FastAPI, Uvicorn, Jinja2 |
+| Browser UI | HTML, CSS, vanilla JavaScript, inline SVG |
+| Language model | Google Gemini via `google-genai` |
+| Financial data access | SQL Server via `pyodbc` |
+| Configuration | YAML and `python-dotenv` |
+| Data and analysis utilities | pandas, NumPy, PyArrow, SQLAlchemy |
+| Tests | Python `unittest` |
 
-## Repository Structure
+## Project Structure
 
 ```text
-AI-Finance-Analyst-Agent/
-├── config/
-│   └── Application configuration
-├── phase_01_data/
-│   └── notebooks/
-│       └── Data exploration and analysis
-├── phase_02_data_engineering/
-│   └── scripts/
-│       └── Data loading, profiling, and preparation
-├── phase_06_api/
-│   └── app/
-│       └── API application components
+.
+├── config/                         # Shared project settings
+├── phase_01_data/notebooks/        # Dataset metadata notebook
+├── phase_02_data_engineering/      # Transaction inspection, profiling, loading
+├── phase_06_api/app/               # API phase dependency placeholder
 ├── phase_08_ai_agent/
-│   └── AI agent, tools, prompts, and interface components
-├── .env.example
+│   ├── agent/                      # FinanceAgent orchestration and validation
+│   ├── agent_config/               # Agent and model configuration
+│   ├── migrations/                 # Review-only SQL migration for forecasts
+│   ├── prompts/                    # Agent system prompt
+│   ├── tests/                      # Forecast and dashboard regression tests
+│   ├── tools/                      # Tool schemas and SQL-backed analytics
+│   └── web_app/                    # FastAPI UI, static assets, templates
+├── .env.example                    # Safe local configuration template
 ├── .gitignore
-├── requirements.txt
-└── README.md
+└── requirements.txt
 ```
 
-The repository is organized into phases to separate data exploration, data engineering, API development, and AI-agent functionality.
+## Requirements and Installation
 
-## Getting Started
+- Windows, macOS, or Linux with Python 3.11 or newer.
+- A SQL Server instance with the expected `AI_Finance` schemas/tables and an installed Microsoft ODBC driver for SQL Server.
+- A Google Gemini API key for Copilot requests.
 
-### 1. Prerequisites
-
-Before running the project, prepare the following as needed for the component you want to use:
-
-- Python 3.11 or a compatible Python version.
-- Git.
-- Microsoft SQL Server and an appropriate SQL Server ODBC driver for database workflows.
-- Access to the required financial dataset.
-- Credentials for any external LLM or other services used by the selected workflow.
-- n8n, if you intend to run the related orchestration workflow.
-
-### 2. Clone the Repository
-
-```bash
-git clone https://github.com/Magedmagdy/AI-Finance-Analyst-Agent.git
-cd AI-Finance-Analyst-Agent
-```
-
-### 3. Create a Virtual Environment
-
-**Windows PowerShell**
+Create and activate a virtual environment from the repository root (PowerShell example):
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks script activation, you can use the virtual environment's Python executable directly instead of changing system execution-policy settings.
-
-### 4. Install the Base Dependencies
-
-```powershell
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+python -m pip install -r phase_08_ai_agent/web_app/requirements-web.txt
 ```
 
-The root requirements file provides baseline data-processing, notebook, SQL Server, and environment-configuration packages. Additional dependencies may be required for individual API, AI-agent, or interface components.
+On macOS or Linux, activate with `source .venv/bin/activate` and use the same pip commands.
 
-### 5. Configure Environment Variables
+## Configuration
 
-Create a local `.env` file from the supplied template:
+Copy the template and edit the local file:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `.env` with values appropriate for your environment.
+The agent loads `GEMINI_API_KEY` from the repository-root `.env`. SQL connectivity supports these variables:
 
-Typical settings include:
+| Variable | Purpose | Default |
+|---|---|---|
+| `AI_FINANCE_SQL_SERVER` | SQL Server host/instance; overrides `SQL_SERVER` | `localhost` |
+| `SQL_SERVER` | Shared SQL Server host/instance | `localhost` |
+| `AI_FINANCE_SQL_DATABASE` | Database used by the Phase 8 tools | `AI_Finance` |
+| `AI_FINANCE_SQL_DRIVER` | Installed ODBC driver name | `ODBC Driver 18 for SQL Server` |
+| `AI_FINANCE_SQL_TRUSTED_CONNECTION` | ODBC trusted connection setting | `yes` |
+| `AI_FINANCE_SQL_ENCRYPT` | ODBC encryption setting | `no` |
+| `AI_FINANCE_SQL_TRUST_SERVER_CERTIFICATE` | ODBC certificate trust setting | `yes` |
+| `GEMINI_API_KEY` | Credential for Google Gemini requests | Required for Copilot |
 
-```dotenv
-SQL_SERVER=localhost
-SQL_PORT=1433
-SQL_DATABASE=AI_Finance
-SQL_USERNAME=
-SQL_PASSWORD=
+The shared `config/settings.py` also reads `SQL_PORT`, `SQL_DATABASE`, `SQL_USERNAME`, `SQL_PASSWORD`, Hugging Face dataset settings, API host/port, generic LLM settings, `APP_ENV`, and `LOG_LEVEL`. The Phase 8 financial tools use the SQL variables listed above; configure the variables relevant to the component you run. Prefer a least-privilege SQL account and do not commit `.env` or real datasets.
 
-HF_DATASET_REPO=ziadatalabs/FreeFinancialTransactions50M
-HF_DATASET_FILE=transactions_50M.parquet
+The SQL forecast migration is at `phase_08_ai_agent/migrations/001_create_financial_forecasts.sql`. It is explicitly review-only and is not run by the application. Have a database owner review and apply it if forecast persistence is needed.
 
-API_HOST=127.0.0.1
-API_PORT=8000
+## Run the Application
 
-LLM_PROVIDER=
-LLM_MODEL=
-LLM_API_KEY=
+From the repository root, with the environment activated:
 
-APP_ENV=development
-LOG_LEVEL=INFO
+```powershell
+python -m uvicorn phase_08_ai_agent.web_app.web_app:app --reload
 ```
 
-These are example configuration values, not credentials or a guarantee that every component reads every variable. Review the relevant source code before running a workflow, and never commit your real `.env` file.
+Or use the virtual environment interpreter directly:
 
-### 6. Prepare the Data Source
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn phase_08_ai_agent.web_app.web_app:app --reload
+```
 
-Before executing data-engineering scripts:
+Open <http://127.0.0.1:8000>. The local command `& "D:\venv311\Scripts\python.exe" -m uvicorn phase_08_ai_agent.web_app.web_app:app --reload` is specific to one Windows machine and is not required for other installations.
 
-1. Review the scripts under `phase_02_data_engineering/scripts/`.
-2. Verify the dataset location and update any machine-specific file paths for your environment.
-3. Configure SQL Server connectivity and confirm that the target database and required permissions are available.
-4. Use an authorized dataset and verify its schema before loading data.
+## Example Questions
 
-Do not assume that downloading the repository alone supplies the underlying financial dataset or configures your local database.
+- “Summarize the available financial data and identify data-quality issues in USD.”
+- “Analyze monthly net cash flow in USD from February to July 2026 and explain the trend.”
+- “Compare actual cash flow in USD across the available periods.”
+- “Identify potential financial risks and support each finding with available evidence.”
+- “Generate a monthly net cash flow forecast in USD and distinguish forecast values from actuals.”
+- “What should management prioritize based on the available data?”
 
-### 7. Run Individual Components
+Examples describe supported tool workflows; they do not guarantee data exists for the requested periods or metrics. Currency-specific numeric aggregations require one supported currency.
 
-Start with the notebooks or scripts relevant to the workflow you want to explore. For the API and AI-agent components, inspect their entry points and required packages before starting services.
+## Testing and Validation
 
-A complete, verified end-to-end installation command is not yet documented in this README. Setup instructions will be refined as the individual components are validated across environments.
+Run the Phase 8 regression tests with the project interpreter:
 
-## Security and Responsible Use
+```powershell
+python -m unittest discover -s phase_08_ai_agent/tests -v
+```
 
-Financial data can contain sensitive information. Please follow these precautions:
+The tests cover tool argument/result contracts, forecast cutoffs and persistence behavior through mocks, chart and currency handling, and API/dashboard request behavior. Mocked tests do not establish that a live SQL Server, Gemini account, or complete production dataset is configured correctly.
 
-- Never commit API keys, passwords, access tokens, or private connection strings.
-- Keep `.env` files and local datasets out of version control.
-- Use synthetic, public, or explicitly authorized financial data for demonstrations.
-- Avoid publishing confidential transaction details, account identifiers, or internal business information.
-- Validate AI-generated calculations and explanations against the underlying data.
-- Treat model-generated insights as analytical assistance, not as a substitute for professional financial judgment.
+## Data and Security Considerations
+
+- Keep API keys, passwords, tokens, private connection strings, and real transaction datasets out of version control. `.env` is ignored; `.env.example` contains example values only.
+- Copilot requests use the configured Gemini API. Do not submit confidential information unless your organization has approved that data flow and the provider configuration.
+- SQL analytics depend on the configured database. The enabled `save_financial_forecast` tool writes forecast records to `mart.financial_forecasts`; review SQL permissions and the migration before enabling persistence.
+- Use a least-privilege database account and synthetic, public, or otherwise authorized data for demonstrations.
+- Validate important financial conclusions against source data and applicable business controls.
 
 ## Current Limitations
 
-- Local data paths and database settings may need to be adapted before running the scripts.
-- Different components may have separate dependency and service requirements.
-- End-to-end setup and validation are still being documented.
-- Forecasting, anomaly detection, and AI-generated analysis require task-specific evaluation before being used for real financial decisions.
+- The app requires an appropriately configured SQL Server schema and does not include private financial data.
+- Copilot requires a valid Gemini API key and network access to the configured Google API.
+- Forecasting currently uses a trailing moving-average method; its output is a forecast and not an observed actual.
+- Forecast persistence requires the separately reviewed `mart.financial_forecasts` table.
+- Automated unit tests use mocks for database and model integrations; live integration and visual verification are environment-dependent.
 
 ## Roadmap
 
-- [ ] Document setup and execution for each project component.
-- [ ] Standardize configuration across data, API, and agent layers.
-- [ ] Add reproducible example data and end-to-end usage examples.
-- [ ] Add automated tests for analytical tools and data-processing workflows.
-- [ ] Evaluate analytical correctness and AI response reliability.
-- [ ] Add sanitized screenshots and a public demo walkthrough.
-- [ ] Document deployment, monitoring, and operational safeguards.
+- Add documented, reproducible integration checks against a disposable SQL Server fixture.
+- Add a sanitized demo dataset and repeatable local demo setup.
+- Expand evaluation of tool selection, numerical correctness, and multilingual responses.
+- Document deployment, monitoring, and operational controls.
 
-## Why This Project?
-
-This project is part of an exploration of the intersection between **Business Intelligence, Data Engineering, Machine Learning, and Generative AI**.
-
-The broader goal is to build systems that make analytical data more accessible while keeping the underlying data processing, calculations, and limitations visible to the people using them.
-
-## Author
+## Author and Repository
 
 **Maged Magdy**
 
-Explore more of my work on [GitHub](https://github.com/Magedmagdy).
+Repository: <https://github.com/Magedmagdy/AI-Finance-Analyst-Agent>
 
 ## Disclaimer
 
-This repository is intended for learning, experimentation, and software development. It does not provide audited financial advice, and it should not be used for financial decisions without appropriate validation, controls, and review.
+This project is for learning and software development. It is not audited financial advice and should not be used for financial decisions without appropriate validation and review.

@@ -31,6 +31,9 @@ agent:
       - "detect_financial_anomalies"
       - "analyze_cash_flow_drivers"
       - "forecast_financial_kpi"
+      - "save_financial_forecast"
+      - "get_saved_financial_forecast"
+      - "compare_saved_forecast_to_actual"
       - "analyze_financial_ratios"
 
     disabled: []

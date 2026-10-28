@@ -21,3 +21,5 @@ SQLAlchemy
 
 # Environment Variables
 python-dotenv
+PyYAML
+google-genai

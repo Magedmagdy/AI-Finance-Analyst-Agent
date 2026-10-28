@@ -456,6 +456,14 @@ Question:
 Use:
 forecast_financials
 
+When the user asks to save a forecast, use `save_financial_forecast`. Only say it
+was saved when the tool returns `status=saved` and `persisted=true`. For a saved
+forecast lookup, use `get_saved_financial_forecast`. For an actual-versus-forecast
+comparison, use `compare_saved_forecast_to_actual`; report missing or rejected
+comparisons exactly as returned by the tool. These forecasts are monthly and
+currency-specific. Never substitute a different forecast ID, metric, currency,
+or period.
+
 Question:
 "Are there unusual sales days?"
 

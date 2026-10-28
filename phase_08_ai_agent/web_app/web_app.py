@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import inspect
 import io
+import logging
 import threading
 import time
+import traceback
 import uuid
 from datetime import date
 from pathlib import Path
@@ -39,6 +41,33 @@ from tools.financial_tools import (  # noqa: E402
     get_financial_kpis,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _log_chat_failure(request_id: str, exc: Exception) -> None:
+    """Log exception type and traceback frames without exception text or locals."""
+    safe_traceback = "".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+        for frame in traceback.extract_tb(exc.__traceback__)
+    )
+    logger.error(
+        "Copilot request failed request_id=%s exception_type=%s\n%s",
+        request_id,
+        type(exc).__name__,
+        safe_traceback,
+    )
+
+
+def _chat_error_message(lang: str) -> str:
+    return (
+        "حدث خطأ أثناء تحليل السؤال. تم تسجيل التفاصيل في سجل التنفيذ. "
+        "يمكنك إعادة المحاولة أو صياغة السؤال مع ذكر العملة والفترة."
+        if lang == "ar"
+        else
+        "The analysis failed. Technical details were captured in the execution log. "
+        "Please retry or specify the currency and period explicitly."
+    )
+
 
 # -----------------------------------------------------------------------------
 # App setup
@@ -57,6 +86,33 @@ app.mount(
 )
 
 templates = Jinja2Templates(directory=str(CURRENT_DIR / "templates"))
+
+
+@app.middleware("http")
+async def chat_request_diagnostics(request: Request, call_next):
+    if request.url.path != "/api/chat":
+        return await call_next(request)
+
+    request_id = uuid.uuid4().hex
+    request.state.chat_request_id = request_id
+    try:
+        result = await call_next(request)
+    except Exception as exc:
+        _log_chat_failure(request_id, exc)
+        lang = getattr(request.state, "chat_lang", "en")
+        result = JSONResponse(
+            {
+                "ok": False,
+                "error": _chat_error_message(lang),
+                "technical_error": type(exc).__name__,
+                "request_id": request_id,
+            },
+            status_code=500,
+            headers={"X-Request-ID": request_id},
+        )
+
+    result.headers["X-Request-ID"] = request_id
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -308,6 +364,7 @@ def _build_executive_dashboard(
         currency=currency,
         metric="net_cash_flow",
         forecast_period=f"{forecast_month}-01",
+        historical_cutoff=selected_to,
         lookback_months=3,
     )
 
@@ -350,10 +407,19 @@ def _build_executive_dashboard(
                 "metric": forecast.get("metric"),
                 "currency": forecast.get("currency"),
                 "forecast_period": forecast.get("forecast_period"),
+                "historical_cutoff": forecast.get("historical_cutoff"),
                 "forecast_value": forecast.get("forecast_value"),
                 "method": forecast.get("method"),
                 "lookback_months": forecast.get("lookback_months"),
                 "historical_periods": forecast.get("historical_periods", []),
+                "source_periods": forecast.get(
+                    "source_periods",
+                    [
+                        item.get("period")
+                        for item in forecast.get("historical_periods", [])
+                        if isinstance(item, dict) and item.get("period")
+                    ],
+                ),
                 "last_actual_period": forecast.get("last_actual_period"),
                 "status": forecast.get("status"),
             },
@@ -411,7 +477,8 @@ async def index(request: Request) -> HTMLResponse:
         try:
             state.dashboard_payload = _build_executive_dashboard("USD")
             state.dashboard_filter = state.dashboard_payload["filters"]
-        except Exception:
+        except Exception as exc:
+            logger.error("Dashboard initialization failed: %s", type(exc).__name__)
             state.dashboard_payload = {}
     page = templates.TemplateResponse(
         request=request,
@@ -436,8 +503,19 @@ async def session_info(request: Request) -> JSONResponse:
                 state.dashboard_filter.get("trend_months", 6),
             )
             state.dashboard_filter = state.dashboard_payload["filters"]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Dashboard session initialization failed: %s", type(exc).__name__)
+            result = JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Dashboard initialization failed. Please retry or check server logs.",
+                },
+                status_code=503,
+            )
+            cookie = response.headers.get("set-cookie")
+            if cookie:
+                result.headers["set-cookie"] = cookie
+            return result
     result = JSONResponse(
         {
             "session_id": session_id,
@@ -473,12 +551,13 @@ async def dashboard(
             }
         )
     except Exception as exc:
+        logger.error("Dashboard API request failed: %s", type(exc).__name__)
         result = JSONResponse(
             {
                 "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": "Dashboard request could not be completed. Check filters or retry.",
             },
-            status_code=400,
+            status_code=400 if isinstance(exc, ValueError) else 503,
         )
     cookie = response.headers.get("set-cookie")
     if cookie:
@@ -489,10 +568,13 @@ async def dashboard(
 @app.post("/api/chat")
 async def chat(request: Request) -> JSONResponse:
     response = Response()
+    request_id = getattr(getattr(request, "state", None), "chat_request_id", None) or uuid.uuid4().hex
+    response.headers["X-Request-ID"] = request_id
     _, state = _get_state(request, response)
     body = await request.json()
     question = str(body.get("question", "")).strip()
     lang = _normalize_lang(body.get("lang"))
+    request.state.chat_lang = lang
     state.lang = lang
 
     if not question:
@@ -503,6 +585,7 @@ async def chat(request: Request) -> JSONResponse:
             },
             status_code=400,
         )
+        result.headers["X-Request-ID"] = request_id
         cookie = response.headers.get("set-cookie")
         if cookie:
             result.headers["set-cookie"] = cookie
@@ -525,20 +608,14 @@ async def chat(request: Request) -> JSONResponse:
             with contextlib.redirect_stdout(stdout_buffer):
                 answer = _ask_agent(state.agent, question, lang)
     except Exception as exc:  # pragma: no cover - runtime integration path
-        error_message = f"{type(exc).__name__}: {exc}"
+        _log_chat_failure(request_id, exc)
+        error_message = type(exc).__name__
 
     captured_logs = stdout_buffer.getvalue()
     state.execution_log = captured_logs
 
     if error_message:
-        user_error = (
-            "حدث خطأ أثناء تحليل السؤال. تم تسجيل التفاصيل في سجل التنفيذ. "
-            "يمكنك إعادة المحاولة أو صياغة السؤال مع ذكر العملة والفترة."
-            if lang == "ar"
-            else
-            "The analysis failed. Technical details were captured in the execution log. "
-            "Please retry or specify the currency and period explicitly."
-        )
+        user_error = _chat_error_message(lang)
         state.ui_messages.append(
             {
                 "role": "error",
@@ -551,6 +628,7 @@ async def chat(request: Request) -> JSONResponse:
                 "ok": False,
                 "error": user_error,
                 "technical_error": error_message,
+                "request_id": request_id,
                 "logs": captured_logs,
                 "session": _session_snapshot(state),
                 "messages": _rendered_history(state),
@@ -574,8 +652,10 @@ async def chat(request: Request) -> JSONResponse:
                 state.dashboard_filter.get("trend_months", 6),
             )
             state.dashboard_filter = state.dashboard_payload["filters"]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Dashboard refresh after Copilot request failed: %s", type(exc).__name__)
+
+        chart_data = getattr(state.agent, "last_chart_data", None)
 
         state.ui_messages.append(
             {
@@ -583,12 +663,14 @@ async def chat(request: Request) -> JSONResponse:
                 "content": answer or "",
                 "ts": time.time(),
                 "analysis_mode": getattr(state.agent, "last_analysis_mode", "single_tool"),
+                "chart": chart_data,
             }
         )
         result = JSONResponse(
             {
                 "ok": True,
                 "answer": answer,
+                "chart": chart_data,
                 "logs": captured_logs,
                 "session": _session_snapshot(state),
                 "messages": _rendered_history(state),
@@ -598,6 +680,7 @@ async def chat(request: Request) -> JSONResponse:
     cookie = response.headers.get("set-cookie")
     if cookie:
         result.headers["set-cookie"] = cookie
+    result.headers["X-Request-ID"] = request_id
     return result
 
 
@@ -615,8 +698,20 @@ async def reset(request: Request) -> JSONResponse:
             state.dashboard_filter.get("month"),
             state.dashboard_filter.get("trend_months", 6),
         )
-    except Exception:
+    except Exception as exc:
+        logger.error("Dashboard refresh after reset failed: %s", type(exc).__name__)
         state.dashboard_payload = {}
+        result = JSONResponse(
+            {
+                "ok": False,
+                "error": "Dashboard initialization failed. Please retry or check server logs.",
+            },
+            status_code=503,
+        )
+        cookie = response.headers.get("set-cookie")
+        if cookie:
+            result.headers["set-cookie"] = cookie
+        return result
     result = JSONResponse(
         {
             "ok": True,

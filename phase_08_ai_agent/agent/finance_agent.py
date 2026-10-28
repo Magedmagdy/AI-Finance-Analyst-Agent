@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import calendar
+import inspect
 import json
 import math
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +39,13 @@ from tools.financial_tools import (  # noqa: E402
     analyze_financial_ratios,
     analyze_financial_trend,
     compare_financial_periods,
+    compare_saved_forecast_to_actual,
     detect_financial_anomalies,
     forecast_financial_kpi,
     get_financial_data_coverage,
     get_financial_kpis,
+    get_saved_financial_forecast,
+    save_financial_forecast,
 )
 
 
@@ -62,6 +67,9 @@ TOOL_FUNCTIONS = {
     "detect_financial_anomalies": detect_financial_anomalies,
     "analyze_cash_flow_drivers": analyze_cash_flow_drivers,
     "forecast_financial_kpi": forecast_financial_kpi,
+    "save_financial_forecast": save_financial_forecast,
+    "get_saved_financial_forecast": get_saved_financial_forecast,
+    "compare_saved_forecast_to_actual": compare_saved_forecast_to_actual,
     "analyze_financial_ratios": analyze_financial_ratios,
 }
 
@@ -170,6 +178,7 @@ class FinanceAgent:
         self.last_verified_results: list[dict[str, Any]] = []
         self.data_boundary: dict[str, Any] = {}
         self.last_analysis_mode: str = "single_tool"
+        self.last_chart_data: dict[str, Any] | None = None
         self.current_health_findings: dict[str, Any] = {}
         self.last_health_findings: dict[str, Any] = {}
 
@@ -582,6 +591,43 @@ class FinanceAgent:
                 f"Drivers={total_driver_change:.2f}, Total={actual_change:.2f}"
             )
 
+        component_rows = result.get("cash_flow_metric_comparisons")
+        if component_rows is not None:
+            if not isinstance(component_rows, list):
+                return False, "Cash-flow metric comparisons must be a list."
+            result_currency = str(result.get("currency", "")).upper()
+            result_period_1 = result.get("period_1", {})
+            result_period_2 = result.get("period_2", {})
+            for row in component_rows:
+                if not isinstance(row, dict) or str(row.get("currency", "")).upper() != result_currency:
+                    return False, "Cash-flow metric comparison currency mismatch."
+                for key, expected_period in (("period_1", result_period_1), ("period_2", result_period_2)):
+                    reported_period = row.get(key)
+                    if not isinstance(reported_period, dict) or any(
+                        reported_period.get(date_key) != expected_period.get(date_key)
+                        for date_key in ("date_from", "date_to")
+                    ):
+                        return False, "Cash-flow metric comparison period mismatch."
+                value_1 = self._as_number(row.get("period_1_value"))
+                value_2 = self._as_number(row.get("period_2_value"))
+                reported_change = self._as_number(row.get("absolute_change"))
+                reported_percentage = self._as_number(row.get("percentage_change"))
+                if row.get("status") != "success":
+                    if reported_change is not None or reported_percentage is not None:
+                        return False, "Unavailable cash-flow metrics must not contain calculated changes."
+                    continue
+                if value_1 is None or value_2 is None or reported_change is None:
+                    return False, "Cash-flow metric comparison is missing a required value."
+                expected_change = value_2 - value_1
+                if not self._numbers_close(reported_change, expected_change, tolerance=0.01):
+                    return False, f"Cash-flow metric absolute change mismatch for {row.get('metric')}."
+                expected_percentage = None if value_1 == 0 else expected_change / abs(value_1) * 100
+                if expected_percentage is None:
+                    if reported_percentage is not None:
+                        return False, f"Cash-flow metric percentage should be unavailable for {row.get('metric')}."
+                elif reported_percentage is None or not self._numbers_close(reported_percentage, expected_percentage, tolerance=0.01):
+                    return False, f"Cash-flow metric percentage mismatch for {row.get('metric')}."
+
         return True, None
 
     # ========================================================
@@ -701,11 +747,19 @@ class FinanceAgent:
         self._validate_numeric_values(result)
 
         status = result.get("status")
-        if status not in {"success", "no_data", "error", "insufficient_data"}:
+        accepted_statuses = {
+            "success", "no_data", "error", "insufficient_data", "saved", "save_failed",
+            "duplicate_id", "forecast_not_found", "actual_not_found", "comparison_success",
+            "comparison_rejected", "retrieval_failed", "invalid_forecast_id",
+        }
+        if status not in accepted_statuses:
             raise ValueError(f"Tool {tool_name} returned an invalid status: {status}")
 
-        if status == "no_data":
-            return True, "ACCEPTED (no_data)"
+        if status in {
+            "no_data", "save_failed", "duplicate_id", "forecast_not_found", "actual_not_found",
+            "comparison_rejected", "retrieval_failed", "invalid_forecast_id",
+        }:
+            return True, f"ACCEPTED ({status})"
 
         if status == "insufficient_data":
             return True, "ACCEPTED (insufficient_data)"
@@ -720,9 +774,13 @@ class FinanceAgent:
             if normalized_currency not in ALLOWED_CURRENCIES:
                 raise ValueError(f"Tool {tool_name} returned unsupported currency: {result_currency}")
 
-        if tool_name == "forecast_financial_kpi":
+        if tool_name in {"forecast_financial_kpi", "save_financial_forecast"} and status in {"success", "saved"}:
             if result.get("is_forecast") is not True:
-                raise ValueError("forecast_financial_kpi must mark is_forecast=true.")
+                raise ValueError(f"{tool_name} must mark is_forecast=true.")
+        if tool_name == "save_financial_forecast" and status == "saved" and result.get("persisted") is not True:
+            raise ValueError("save_financial_forecast may return saved only after confirmed persistence.")
+        if tool_name == "get_saved_financial_forecast" and status == "success" and result.get("persisted") is not True:
+            raise ValueError("get_saved_financial_forecast success must identify a persisted record.")
 
         latest_actual = self._latest_actual_date()
         requested_period = result.get("requested_period")
@@ -807,6 +865,37 @@ class FinanceAgent:
 
         return None
 
+    def _resolve_currency(self, question: str) -> str | None:
+        """Resolve one currency from the current question or consistent verified context."""
+        explicit_currency = self._extract_currency(question)
+        if explicit_currency:
+            return explicit_currency
+
+        prior_question_currency = self._extract_currency(getattr(self, "last_question", None) or "")
+        verified_currencies: set[str] = set()
+        context_conflict = False
+        for item in getattr(self, "last_verified_results", []) or []:
+            if not isinstance(item, dict):
+                continue
+            result = item.get("result")
+            arguments = item.get("arguments")
+            result_currency = result.get("currency") if isinstance(result, dict) else None
+            argument_currency = arguments.get("currency") if isinstance(arguments, dict) else None
+            result_currency = str(result_currency).strip().upper() if result_currency else None
+            argument_currency = str(argument_currency).strip().upper() if argument_currency else None
+            if result_currency and argument_currency and result_currency != argument_currency:
+                context_conflict = True
+            currency = result_currency or argument_currency
+            if currency:
+                verified_currencies.add(currency)
+
+        if context_conflict or len(verified_currencies) > 1:
+            return None
+        verified_currency = next(iter(verified_currencies), None)
+        if prior_question_currency and verified_currency and prior_question_currency != verified_currency:
+            return None
+        return verified_currency or prior_question_currency
+
     # ========================================================
     # MONTH PERIOD EXTRACTION
     # ========================================================
@@ -847,6 +936,37 @@ class FinanceAgent:
         }
 
         matches: list[tuple[int, dict[str, str]]] = []
+
+        # A year at the end of a range applies to both endpoints, as in
+        # "from February to July 2026" / "من فبراير إلى يوليو 2026".
+        english_names = "|".join(re.escape(name) for name in sorted(english_months, key=len, reverse=True))
+        english_range = re.compile(
+            rf"\b(?:from\s+)?({english_names})\s+(?:to|through|until|[-–—])\s+({english_names})\s+(20\d{{2}})\b",
+            re.IGNORECASE,
+        )
+        for match in english_range.finditer(text):
+            year = int(match.group(3))
+            for offset, month_name in ((0, match.group(1)), (1, match.group(2))):
+                month_number = english_months[month_name.lower()]
+                last_day = calendar.monthrange(year, month_number)[1]
+                matches.append((match.start() + offset, {
+                    "date_from": f"{year:04d}-{month_number:02d}-01",
+                    "date_to": f"{year:04d}-{month_number:02d}-{last_day:02d}",
+                }))
+
+        arabic_names = "|".join(
+            re.escape(name) for name in sorted(arabic_months, key=len, reverse=True)
+        )
+        arabic_range = re.compile(rf"من\s+({arabic_names})\s+إلى\s+({arabic_names})\s*(20\d{{2}})")
+        for match in arabic_range.finditer(text):
+            year = int(match.group(3))
+            for offset, month_name in ((0, match.group(1)), (1, match.group(2))):
+                month_number = arabic_months[month_name]
+                last_day = calendar.monthrange(year, month_number)[1]
+                matches.append((match.start() + offset, {
+                    "date_from": f"{year:04d}-{month_number:02d}-01",
+                    "date_to": f"{year:04d}-{month_number:02d}-{last_day:02d}",
+                }))
 
         # ISO dates: YYYY-MM-DD.
         iso_pattern = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
@@ -899,6 +1019,74 @@ class FinanceAgent:
             result.append(period)
 
         return result
+
+    @staticmethod
+    def _is_chart_request(question: str) -> bool:
+        text = str(question or "").strip().lower()
+        return any(token in text for token in (
+            "chart", "graph", "plot", "visuali", "رسم بياني", "رسمًا بيانيًا",
+            "رسم بيانيًا", "مخطط", "ارسم", "اعرض في رسم", "اعرض رسم",
+        ))
+
+    def _build_chat_chart(
+        self,
+        question: str,
+        verified_results: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not self._is_chart_request(question):
+            return None
+        metric = self._infer_metric_from_question(question)
+        if not metric:
+            return None
+
+        for item in reversed(verified_results):
+            if not isinstance(item, dict) or item.get("tool_name") != "analyze_financial_trend":
+                continue
+            arguments = item.get("arguments")
+            result = item.get("result")
+            if not isinstance(arguments, dict) or not isinstance(result, dict):
+                continue
+            currency = str(arguments.get("currency") or "").strip().upper()
+            if (
+                result.get("status") != "success"
+                or not currency
+                or str(result.get("currency") or "").strip().upper() != currency
+                or result.get("metric") != metric
+                or not (result.get("data_quality") or {}).get("actual_data")
+            ):
+                continue
+
+            points = []
+            for row in result.get("results") or []:
+                if not isinstance(row, dict) or str(row.get("currency") or "").upper() != currency:
+                    return None
+                value = row.get("value")
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return None
+                period = str(row.get("period") or "")
+                if not re.fullmatch(r"20\d{2}-\d{2}", period):
+                    return None
+                points.append({"period": period, "value": value})
+            points.sort(key=lambda point: point["period"])
+            if not points:
+                continue
+
+            arabic = self.response_language == "ar"
+            title = "اتجاه صافي التدفق النقدي الشهري" if arabic else "Monthly net cash flow"
+            if metric != "net_cash_flow":
+                title = metric.replace("_", " ")
+            return {
+                "type": "line",
+                "title": title,
+                "metric": metric,
+                "currency": currency,
+                "source_tool": "analyze_financial_trend",
+                "status": result.get("status"),
+                "data_quality": result.get("data_quality"),
+                "requested_period": result.get("requested_period"),
+                "points": points,
+            }
+        return None
 
     # ========================================================
     # METRIC INFERENCE
@@ -1056,6 +1244,12 @@ class FinanceAgent:
 
     def _infer_follow_up_intent(self, question: str) -> str:
         text = question.strip().lower()
+        if self._has_any(text, ["forecast", "projection", "توقع", "تنبؤ"]) and self._has_any(
+            text, ["compare", "comparison", "versus", " vs ", "actual", "actuals", "مقارنة", "قارن", "بالفعلي"]
+        ):
+            return "saved_forecast_comparison"
+        if self._has_any(text, ["saved forecast", "previous forecast", "forecast id", "المتوقع المحفوظ"]):
+            return "saved_forecast_retrieval"
         if self._has_any(text, [
             "forecast", "next month", "next period", "what should we expect", "what to expect",
             "expected", "projection", "projected", "توقع", "التوقع", "تنبؤ", "التنبؤ",
@@ -1098,6 +1292,8 @@ class FinanceAgent:
 
     def _select_follow_up_tools(self, question: str) -> list[str]:
         mapping = {
+            "saved_forecast_comparison": "compare_saved_forecast_to_actual",
+            "saved_forecast_retrieval": "get_saved_financial_forecast",
             "forecast": "forecast_financial_kpi",
             "anomaly": "detect_financial_anomalies",
             "ratio": "analyze_financial_ratios",
@@ -1118,6 +1314,8 @@ class FinanceAgent:
         if intent in {"summary", "context"}:
             return bool(self.last_health_findings) or self.last_analysis_mode == "compound_financial_analysis"
         mapping = {
+            "saved_forecast_comparison": "compare_saved_forecast_to_actual",
+            "saved_forecast_retrieval": "get_saved_financial_forecast",
             "forecast": "forecast_financial_kpi",
             "anomaly": "detect_financial_anomalies",
             "ratio": "analyze_financial_ratios",
@@ -1251,6 +1449,7 @@ class FinanceAgent:
         self.last_health_findings = {}
         self.last_response_text = None
         self.last_suggested_questions = []
+        self.last_chart_data = None
         print("Conversation context cleared. Data boundary remains available from the database.")
 
     # ========================================================
@@ -1271,6 +1470,10 @@ class FinanceAgent:
             "full financial analysis",
             "comprehensive financial",
             "executive financial analysis",
+            "management priorities",
+            "management prioritize",
+            "what should management prioritize",
+            "what are the management priorities",
             "analyze financial performance",
             "analyse financial performance",
             "give me a complete analysis",
@@ -1286,6 +1489,7 @@ class FinanceAgent:
             "تحليل الوضع المالي", "الأداء المالي", "الوضع المالي",
             "ماذا حدث ولماذا", "اشرح ما حدث", "اشرح ماذا حدث",
             "المحركات الرئيسية والشذوذ", "المحركات والشذوذ",
+            "أولويات الإدارة", "ما أولويات الإدارة", "ما الذي ينبغي على الإدارة التركيز عليه",
             "ما المتوقع الشهر القادم", "ماذا نتوقع الشهر القادم",
         ]
 
@@ -1349,18 +1553,9 @@ class FinanceAgent:
                 if value not in (None, "", [], {}):
                     inferred[key] = value
 
-        currency = self._extract_currency(question)
+        currency = self._resolve_currency(question)
         if currency:
             inferred["currency"] = currency
-        else:
-            # Context fallback for short / Arabic questions that omit the currency.
-            previous_currency = None
-            for source_question in (question, self.last_question or ""):
-                previous_currency = self._extract_currency(source_question)
-                if previous_currency:
-                    break
-            if previous_currency:
-                inferred["currency"] = previous_currency
 
         metric = self._infer_metric_from_question(question)
         if metric:
@@ -1373,18 +1568,36 @@ class FinanceAgent:
         # Forecast
         # ----------------------------------------------------
 
-        if tool_name == "forecast_financial_kpi":
+        if tool_name in {"forecast_financial_kpi", "save_financial_forecast"}:
             lookback = self._infer_lookback_months(question) or 3
             inferred["lookback_months"] = lookback
 
-            if latest_actual:
+            if periods:
+                inferred["forecast_period"] = periods[-1]["date_from"]
+            elif latest_actual:
                 inferred["forecast_period"] = self._next_month_start(latest_actual)
-                inferred["date_to"] = latest_actual
 
-                if not inferred.get("metric"):
-                    inferred["metric"] = "net_cash_flow"
+            if not inferred.get("metric"):
+                inferred["metric"] = "net_cash_flow"
 
             return inferred
+
+        if tool_name in {"get_saved_financial_forecast", "compare_saved_forecast_to_actual"}:
+            match = re.search(
+                r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+                question,
+                re.IGNORECASE,
+            )
+            forecast_id = match.group(0) if match else None
+            if not forecast_id:
+                for item in reversed(getattr(self, "last_verified_results", [])):
+                    if not isinstance(item, dict):
+                        continue
+                    result = item.get("result")
+                    if isinstance(result, dict) and result.get("forecast_id"):
+                        forecast_id = str(result["forecast_id"])
+                        break
+            return {"forecast_id": forecast_id} if forecast_id else {}
 
         # ----------------------------------------------------
         # Comparison / Drivers
@@ -1395,8 +1608,9 @@ class FinanceAgent:
                 periods = self._context_periods_for_follow_up(question)
 
             if len(periods) >= 2:
-                first = periods[0]
-                second = periods[-1]
+                ordered_periods = sorted(periods, key=lambda period: period["date_from"])
+                first = ordered_periods[0]
+                second = ordered_periods[-1]
                 inferred.update(
                     {
                         "period_1_from": first["date_from"],
@@ -1511,6 +1725,11 @@ class FinanceAgent:
         question: str,
     ) -> dict[str, Any]:
         normalized = dict(arguments)
+        if tool_name in {"forecast_financial_kpi", "save_financial_forecast"} and {"date_from", "date_to"} & normalized.keys():
+            raise ValueError(
+                f"{tool_name} no longer accepts date_from/date_to; "
+                "provide forecast_period and historical_cutoff explicitly."
+            )
         inferred = self._infer_tool_arguments(tool_name, question)
 
         # Legacy aliases from an older agent version.
@@ -1528,12 +1747,25 @@ class FinanceAgent:
             if key not in normalized or normalized.get(key) in (None, "", [], {}):
                 normalized[key] = value
 
-        detected_currency = self._extract_currency(question)
-        current_currency = normalized.get("currency")
-        if detected_currency and not current_currency:
-            normalized["currency"] = detected_currency
-        elif current_currency:
-            normalized["currency"] = str(current_currency).strip().upper()
+        resolved_currency = self._resolve_currency(question)
+        if resolved_currency:
+            # Never allow model-proposed currency arguments to override the
+            # currency stated by the user or established by verified context.
+            normalized["currency"] = resolved_currency
+
+        if tool_name in {"compare_financial_periods", "analyze_cash_flow_drivers"}:
+            periods = self._extract_month_periods(question)
+            if len(periods) >= 2:
+                ordered_periods = sorted(periods, key=lambda period: period["date_from"])
+                first, second = ordered_periods[0], ordered_periods[-1]
+                normalized.update(
+                    {
+                        "period_1_from": first["date_from"],
+                        "period_1_to": first["date_to"],
+                        "period_2_from": second["date_from"],
+                        "period_2_to": second["date_to"],
+                    }
+                )
 
         if not normalized.get("metric") and tool_name in {
             "get_financial_kpis",
@@ -1567,14 +1799,17 @@ class FinanceAgent:
                 "period_2_from", "period_2_to",
             },
             "forecast_financial_kpi": {"currency", "metric", "forecast_period"},
+            "save_financial_forecast": {"currency", "metric", "forecast_period"},
+            "get_saved_financial_forecast": {"forecast_id"},
+            "compare_saved_forecast_to_actual": {"forecast_id"},
             "analyze_financial_ratios": {"currency", "date_from", "date_to"},
         }
 
         required = required_by_tool.get(tool_name, set())
         latest_actual = self._latest_actual_date()
 
-        if "currency" in required and not normalized.get("currency"):
-            normalized["currency"] = self._extract_currency(question) or self._extract_currency(self.last_question or "") or "USD"
+        if "currency" in required and not resolved_currency:
+            raise ValueError("Currency is unspecified or prior results conflict. Please specify a currency.")
 
         if "metric" in required and not normalized.get("metric"):
             normalized["metric"] = self._infer_metric_from_question(question) or self._default_primary_metric(question)
@@ -1600,7 +1835,8 @@ class FinanceAgent:
             if period_values and not all(normalized.get(key) for key in period_values):
                 periods = self._extract_month_periods(question) or self._context_periods_for_follow_up(question)
                 if len(periods) >= 2:
-                    p1, p2 = periods[0], periods[-1]
+                    ordered_periods = sorted(periods, key=lambda period: period["date_from"])
+                    p1, p2 = ordered_periods[0], ordered_periods[-1]
                 elif len(periods) == 1:
                     p2 = periods[0]
                     p1 = self._previous_month_period(p2["date_from"])
@@ -1618,6 +1854,8 @@ class FinanceAgent:
             key for key in required if normalized.get(key) in (None, "", [], {})
         )
         if missing_required:
+            if "forecast_id" in missing_required:
+                raise ValueError("Please provide the forecast ID returned when the forecast was saved.")
             raise ValueError(
                 f"Unable to determine required arguments for {tool_name}: {missing_required}. "
                 "Please specify the currency and period explicitly."
@@ -1627,7 +1865,7 @@ class FinanceAgent:
         # Forecast normalization
         # ----------------------------------------------------
 
-        if tool_name == "forecast_financial_kpi":
+        if tool_name in {"forecast_financial_kpi", "save_financial_forecast"}:
             latest_actual = self._latest_actual_date()
 
             lookback = normalized.get("lookback_months") or self._infer_lookback_months(question) or 3
@@ -1639,13 +1877,25 @@ class FinanceAgent:
             normalized["lookback_months"] = lookback
 
             forecast_period = normalized.get("forecast_period")
-            if latest_actual:
-                expected_next = self._next_month_start(latest_actual)
-                if not forecast_period or forecast_period <= latest_actual:
-                    forecast_period = expected_next
+            if not forecast_period and latest_actual:
+                forecast_period = self._next_month_start(latest_actual)
 
             if forecast_period:
                 normalized["forecast_period"] = forecast_period
+                if not normalized.get("historical_cutoff"):
+                    # Default to the day before the requested target month; the
+                    # forecast service still excludes any incomplete month.
+                    target_start = datetime.strptime(forecast_period, "%Y-%m-%d").date()
+                    normalized["historical_cutoff"] = (target_start - timedelta(days=1)).isoformat()
+
+        if tool_name in TOOL_FUNCTIONS:
+            callable_arguments = set(inspect.signature(TOOL_FUNCTIONS[tool_name]).parameters)
+            unexpected_arguments = sorted(set(normalized) - callable_arguments)
+            if unexpected_arguments:
+                raise ValueError(
+                    f"Unsupported arguments for {tool_name}: {unexpected_arguments}. "
+                    "The tool schema must match the registered function signature."
+                )
 
         return normalized
 
@@ -1667,11 +1917,54 @@ class FinanceAgent:
             self.last_analysis_mode = "follow_up_contextual"
             return []
 
+        requested_component_groups = (
+            ("inflows", "inflow", "التدفقات الداخلة", "التدفقات الواردة"),
+            ("outflows", "outflow", "التدفقات الخارجة", "التدفقات الصادرة"),
+            ("fees", "fee", "الرسوم", "رسوم"),
+            ("refunds", "refund", "المرتجعات", "المبالغ المستردة"),
+        )
+        periods = self._extract_month_periods(question)
+        requests_all_components = all(any(term in text for term in group) for group in requested_component_groups)
+        if requests_all_components and len(periods) >= 2 and "analyze_cash_flow_drivers" in self.enabled_tools:
+            self.last_analysis_mode = "compound_financial_analysis"
+            return ["analyze_cash_flow_drivers"]
+
         selected: list[str] = []
 
         def add_tool(name: str) -> None:
             if name in self.enabled_tools and name not in selected:
                 selected.append(name)
+
+        if self._is_chart_request(question):
+            add_tool("analyze_financial_trend")
+            if selected:
+                self.last_analysis_mode = "single_tool"
+                return selected
+
+        forecast_context = self._has_any(text, [
+            "forecast", "projection", "projected", "توقع", "توقعات", "تنبؤ", "التنبؤ",
+        ])
+        compare_words = self._has_any(text, ["compare", "comparison", "versus", " vs ", "vs.", "مقارنة", "قارن", "مقابل"])
+        actual_words = self._has_any(text, ["actual", "actuals", "with actual", "vs actual", "بالفعلي", "الفعلية"])
+        if forecast_context and compare_words and actual_words:
+            add_tool("compare_saved_forecast_to_actual")
+            self.last_analysis_mode = "single_tool"
+            return selected
+
+        save_words = bool(re.search(r"\b(save|store|persist)\b", text)) or self._has_any(
+            text, ["احفظ", "حفظ", "تخزين"]
+        )
+        if forecast_context and save_words:
+            add_tool("save_financial_forecast")
+            self.last_analysis_mode = "single_tool"
+            return selected
+
+        saved_words = self._has_any(text, ["saved", "previous forecast", "retrieve", "load forecast", "show saved", "المحفوظ", "المحفوظة"])
+        retrieve_words = self._has_any(text, ["retrieve", "load", "get", "show", "find", "استرجاع", "اعرض", "أظهر"])
+        if forecast_context and saved_words and retrieve_words:
+            add_tool("get_saved_financial_forecast")
+            self.last_analysis_mode = "single_tool"
+            return selected
 
         compound = self._is_compound_question(question)
         periods = self._extract_month_periods(question)
@@ -1857,6 +2150,9 @@ class FinanceAgent:
         periods = self._extract_month_periods(question)
         latest_actual = self._latest_actual_date()
         metric = self._default_primary_metric(question)
+        currency = self._resolve_currency(question)
+        if not currency:
+            raise ValueError("Currency is unspecified or prior results conflict. Please specify a currency.")
 
         if tool_name == "get_financial_kpis":
             if periods:
@@ -1865,9 +2161,9 @@ class FinanceAgent:
                 target_start = latest_actual[:8] + "01"
                 target = {"date_from": target_start, "date_to": latest_actual}
             else:
-                return {"currency": self._extract_currency(question) or "USD", "date_from": "1900-01-01", "date_to": "1900-01-01", "metric": metric}
+                return {"currency": currency, "date_from": "1900-01-01", "date_to": "1900-01-01", "metric": metric}
             return {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "date_from": target["date_from"],
                 "date_to": target["date_to"],
                 "metric": metric,
@@ -1882,14 +2178,15 @@ class FinanceAgent:
             else:
                 target = {"date_from": "1900-01-01", "date_to": "1900-01-01"}
             return {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "date_from": target["date_from"],
                 "date_to": target["date_to"],
             }
 
         if tool_name in {"compare_financial_periods", "analyze_cash_flow_drivers"}:
             if len(periods) >= 2:
-                p1, p2 = periods[0], periods[-1]
+                ordered_periods = sorted(periods, key=lambda period: period["date_from"])
+                p1, p2 = ordered_periods[0], ordered_periods[-1]
             elif len(periods) == 1:
                 p2 = periods[0]
                 p1 = self._previous_month_period(p2["date_from"])
@@ -1901,14 +2198,14 @@ class FinanceAgent:
                 return {}
 
             return {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "metric": metric,
                 "period_1_from": p1["date_from"],
                 "period_1_to": p1["date_to"],
                 "period_2_from": p2["date_from"],
                 "period_2_to": p2["date_to"],
             } if tool_name == "compare_financial_periods" else {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "period_1_from": p1["date_from"],
                 "period_1_to": p1["date_to"],
                 "period_2_from": p2["date_from"],
@@ -1929,7 +2226,7 @@ class FinanceAgent:
                 return {}
 
             return {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "metric": metric,
                 "date_from": start,
                 "date_to": end,
@@ -1944,7 +2241,7 @@ class FinanceAgent:
                 return {}
 
             return {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "date_from": target["date_from"],
                 "date_to": target["date_to"],
                 "threshold": 3.5,
@@ -1952,7 +2249,7 @@ class FinanceAgent:
 
         if tool_name == "forecast_financial_kpi":
             args = {
-                "currency": inferred.get("currency") or self._extract_currency(question) or "USD",
+                "currency": currency,
                 "metric": metric,
                 "forecast_period": inferred.get("forecast_period") or (
                     self._next_month_start(latest_actual) if latest_actual else None
@@ -2367,6 +2664,7 @@ class FinanceAgent:
             parameters = (
                 definition.get("parameters")
                 or definition.get("parameters_json_schema")
+                or definition.get("input_schema")
                 or {"type": "object", "properties": {}}
             )
 
@@ -2442,6 +2740,10 @@ IMPORTANT FINANCIAL ANALYST RULES:
     - forecast view
     - limitations / data coverage
 16. Be concise, factual, and explicit about data boundaries.
+17. Use one currency only: the resolved currency in the verified result. If the currency, period, or requested metric is missing or conflicts, state that limitation instead of presenting the figures as reliable.
+18. Transaction-type movements are observed associations, not proof of business causes. Attribute a cause only when a verified result directly supports it; otherwise say the cause is not established.
+19. Fees and refunds are reported separately from their broader flow totals. Do not add them to total_outflows or total_inflows.
+20. When the user explicitly requests a chart or graph, the Copilot UI renders it separately from verified tool results. Explain the observed trend, and do not claim that this interface cannot display charts.
 """
 
         return self.system_prompt + language_rules + "\n\n" + runtime_rules
@@ -2496,6 +2798,9 @@ FINAL ANSWER RULES:
 - Do not invent a health score, risk score, or accounting classification.
 - Preserve the exact sign of monetary changes and percentages.
 - State the evidence behind important conclusions.
+- Use one currency only: the resolved currency in the verified result. If the currency, period, or requested metric is missing or conflicts, state that limitation instead of presenting the figures as reliable.
+- Transaction-type movements are observed associations, not proof of business causes. Attribute a cause only when a verified result directly supports it; otherwise say the cause is not established.
+- Fees and refunds are reported separately from their broader flow totals. Do not add them to total_outflows or total_inflows.
 - Do not convert descriptive transaction-model indicators into statutory accounting conclusions.
 - Do not rank political or otherwise unrelated choices.
 """
@@ -2536,10 +2841,12 @@ FINAL ANSWER RULES:
         question_metadata = {
             "language": self.response_language,
             "detected_currency": self._extract_currency(question),
+            "resolved_currency": self._resolve_currency(question),
             "detected_periods": self._extract_month_periods(question),
             "inferred_metric": self._infer_metric_from_question(question),
             "follow_up": self._is_follow_up_question(question),
             "canonical_note": "Use ISO dates and ISO currency codes for tool arguments.",
+            "scope_rule": "Use one resolved currency and the exact verified period dates. Do not present missing or conflicting metric values as reliable.",
         }
         metadata_text = json.dumps(
             make_json_safe(question_metadata),
@@ -2634,6 +2941,7 @@ FINAL ANSWER RULES:
     def ask(self, question: str, language: str | None = None) -> str:
         question = question.strip()
         self.response_language = self._normalize_language(language, question)
+        self.last_chart_data = None
         if not question:
             return "من فضلك اكتب سؤالًا ماليًا." if self.response_language == "ar" else "Please provide a financial question."
 
@@ -2651,6 +2959,35 @@ FINAL ANSWER RULES:
             print(self.data_boundary)
 
         selected_tools = self._select_tools_for_question(question)
+
+        # A broad management question may be answerable from currency-separated
+        # evidence. Keep anomaly analysis (which groups by currency) available,
+        # while withholding tools that aggregate monetary values across an
+        # unspecified currency. Their normal argument validation still asks
+        # for a currency when they are selected for a numeric request.
+        if not self._resolve_currency(question) and self.last_analysis_mode == "compound_financial_analysis":
+            selected_tools = [
+                name for name in selected_tools if name == "detect_financial_anomalies"
+            ]
+            self.last_analysis_mode = "single_tool"
+
+        # Missing currency is an expected clarification for aggregations that
+        # require one currency. Resolve it after routing so currency-separated
+        # tools can still answer broad questions without forcing a currency.
+        currency_required_tools = {
+            "get_financial_kpis", "compare_financial_periods",
+            "analyze_financial_trend", "analyze_cash_flow_drivers",
+            "forecast_financial_kpi", "save_financial_forecast",
+            "analyze_financial_ratios",
+        }
+        if selected_tools and not self._resolve_currency(question) and any(
+            name in currency_required_tools for name in selected_tools
+        ):
+            return (
+                "يرجى تحديد العملة المطلوبة (مثل USD) قبل تجميع الأرقام المالية."
+                if self.response_language == "ar"
+                else "Please specify the currency (for example, USD) before I aggregate financial figures."
+            )
 
         # ----------------------------------------------------
         # Context-only follow-up
@@ -2852,6 +3189,7 @@ If a tool returned no_data or insufficient_data, state that limitation.
                         "result": result,
                     }
                 )
+                self.last_chart_data = self._build_chat_chart(question, verified_results)
                 new_tools_executed = True
 
             if new_tools_executed:

@@ -16,18 +16,13 @@
             "type": "string",
             "description": "End date in YYYY-MM-DD format. Inclusive. Example: July 2026 ends on 2026-07-31."
           },
-          "metrics": {
-            "type": "array",
-            "description": "Requested KPI names. Examples: total_inflows, total_outflows, net_cash_flow, fees, refunds, transfers, transactions, completed_transactions, pending_transactions, failed_transactions, reversed_transactions, active_accounts, average_transaction_amount.",
-            "items": {
-              "type": "string"
-            },
-            "minItems": 1,
-            "uniqueItems": true
+          "metric": {
+            "type": "string",
+            "description": "Optional KPI name. Examples: total_inflows, total_outflows, net_cash_flow, fees, refunds, transfers, transactions, completed_transactions, pending_transactions, failed_transactions, reversed_transactions, active_accounts, average_transaction_amount."
           },
           "currency": {
             "type": "string",
-            "description": "Optional currency filter.",
+            "description": "Currency code. This tool requires one currency for aggregation.",
             "enum": [
               "USD",
               "EUR",
@@ -41,7 +36,7 @@
         "required": [
           "date_from",
           "date_to",
-          "metrics"
+          "currency"
         ],
         "additionalProperties": false
       }
@@ -74,7 +69,7 @@
           },
           "currency": {
             "type": "string",
-            "description": "Optional currency filter.",
+            "description": "Currency code. This tool requires one currency for aggregation.",
             "enum": [
               "USD",
               "EUR",
@@ -90,7 +85,8 @@
           "date_to_1",
           "date_from_2",
           "date_to_2",
-          "metric"
+          "metric",
+          "currency"
         ],
         "additionalProperties": false
       }
@@ -115,7 +111,7 @@
           },
           "currency": {
             "type": "string",
-            "description": "Optional currency filter.",
+            "description": "Currency code. This tool requires one currency for aggregation.",
             "enum": [
               "USD",
               "EUR",
@@ -129,7 +125,8 @@
         "required": [
           "date_from",
           "date_to",
-          "metric"
+          "metric",
+          "currency"
         ],
         "additionalProperties": false
       }
@@ -147,10 +144,6 @@
           "date_to": {
             "type": "string",
             "description": "End date in YYYY-MM-DD format. Inclusive."
-          },
-          "metric": {
-            "type": "string",
-            "description": "KPI to analyze for anomalies. Examples: net_cash_flow, total_outflows, total_inflows, fees, refunds, transfers, transactions, active_accounts, average_transaction_amount."
           },
           "currency": {
             "type": "string",
@@ -171,8 +164,7 @@
         },
         "required": [
           "date_from",
-          "date_to",
-          "metric"
+          "date_to"
         ],
         "additionalProperties": false
       }
@@ -216,24 +208,25 @@
           "date_from_1",
           "date_to_1",
           "date_from_2",
-          "date_to_2"
+          "date_to_2",
+          "currency"
         ],
         "additionalProperties": false
       }
     },
     {
       "name": "forecast_financial_kpi",
-      "description": "Forecasts the next monthly value of a verified banking financial KPI using a trailing moving average of the latest completed months. Use this tool when the user asks for a forecast, projection, expected next month value, or future KPI. Forecasts must be clearly labeled as forecasts and remain separated by currency.",
+      "description": "Calculates a non-persisted monthly KPI forecast using completed observations on or before an inclusive historical cutoff. Forecasts remain separated by currency.",
       "input_schema": {
         "type": "object",
         "properties": {
-          "date_from": {
+          "forecast_period": {
             "type": "string",
-            "description": "Start date of the historical period in YYYY-MM-DD format. Inclusive."
+            "description": "Target month start in YYYY-MM-01 format."
           },
-          "date_to": {
+          "historical_cutoff": {
             "type": "string",
-            "description": "End date of the historical period in YYYY-MM-DD format. Inclusive."
+            "description": "Inclusive as-of date YYYY-MM-DD. Only complete monthly observations ending on or before this date are eligible."
           },
           "metric": {
             "type": "string",
@@ -241,7 +234,7 @@
           },
           "currency": {
             "type": "string",
-            "description": "Optional currency filter.",
+            "description": "Currency of the metric; currencies are never combined.",
             "enum": [
               "USD",
               "EUR",
@@ -253,16 +246,57 @@
           },
           "lookback_months": {
             "type": "integer",
-            "description": "Number of latest completed months used in the moving-average forecast. Default is 3.",
+            "description": "Number of consecutive completed calendar months used in the moving-average forecast.",
             "minimum": 1,
             "maximum": 24
           }
         },
         "required": [
-          "date_from",
-          "date_to",
+          "currency",
+          "forecast_period",
+          "historical_cutoff",
           "metric"
         ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "save_financial_forecast",
+      "description": "Calculate a cutoff-safe monthly forecast and save it. Returns persisted=true only after the database commit succeeds.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "currency": {"type": "string", "enum": ["USD", "EUR", "GBP", "CAD", "JPY", "AUD"]},
+          "metric": {"type": "string", "description": "Metric to forecast, such as net_cash_flow."},
+          "forecast_period": {"type": "string", "description": "Target month start YYYY-MM-01."},
+          "historical_cutoff": {"type": "string", "description": "Inclusive historical cutoff YYYY-MM-DD."},
+          "lookback_months": {"type": "integer", "minimum": 1, "maximum": 24}
+        },
+        "required": ["currency", "metric", "forecast_period", "historical_cutoff"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_saved_financial_forecast",
+      "description": "Retrieve a saved forecast by its unique forecast ID.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "forecast_id": {"type": "string", "description": "Unique ID returned by save_financial_forecast."}
+        },
+        "required": ["forecast_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "compare_saved_forecast_to_actual",
+      "description": "Compare a saved forecast with actuals only for the same metric, currency, unit definition, monthly grain, and target month.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "forecast_id": {"type": "string", "description": "Unique ID returned by save_financial_forecast."}
+        },
+        "required": ["forecast_id"],
         "additionalProperties": false
       }
     },

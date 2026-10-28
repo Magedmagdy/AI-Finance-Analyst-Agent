@@ -5,6 +5,7 @@ let dashboardState = null;
 let selectedTrendMonths = 6;
 let lastSnapshot = null;   // last session snapshot (re-rendered on language change)
 let lastMessages = [];     // last chat messages (re-rendered on language change)
+let chartSvgSequence = 0;
 
 const $ = (id) => document.getElementById(id);
 const t = (key, vars) => window.I18N.t(key, vars);
@@ -58,23 +59,42 @@ function tr(prefix, value, fallback) {
 }
 
 function renderAnswer(text) {
-  let s = escapeHtml(text || '');
-  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  const lines = s.split(/\n/);
+  const normalized = String(text || '').replace(/\\([\\`*_{}\[\]()#+\-.!|>])/g, '$1');
+  const lines = escapeHtml(normalized).split(/\r?\n/);
   let out = '';
   let inList = false;
-  for (const line of lines) {
+  const closeList = () => { if (inList) { out += '</ul>'; inList = false; } };
+  const tableCells = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
     const trimmed = line.trim();
+    if (trimmed.includes('|') && i + 1 < lines.length && /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(lines[i + 1].trim())) {
+      closeList();
+      const headers = tableCells(trimmed);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().includes('|')) {
+        rows.push(tableCells(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+      out += `<div class="answer-table-wrap"><table class="answer-table"><thead><tr>${headers.map(cell => `<th>${cell.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${headers.map((_, index) => `<td>${(row[index] || '').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+      continue;
+    }
     if (/^[-*]\s+/.test(trimmed)) {
       if (!inList) { out += '<ul dir="auto">'; inList = true; }
-      out += `<li>${trimmed.replace(/^[-*]\s+/, '')}</li>`;
+      out += `<li>${trimmed.replace(/^[-*]\s+/, '').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</li>`;
     } else {
-      if (inList) { out += '</ul>'; inList = false; }
+      closeList();
       if (!trimmed) out += '<div class="spacer"></div>';
-      else out += `<div dir="auto">${trimmed}</div>`;
+      else if (/^#{1,6}\s+/.test(trimmed)) {
+        const level = trimmed.match(/^#+/)[0].length;
+        const heading = trimmed.replace(/^#{1,6}\s+/, '').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        out += `<h${level} dir="auto" class="answer-heading">${heading}</h${level}>`;
+      } else out += `<div dir="auto">${trimmed.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</div>`;
     }
   }
-  if (inList) out += '</ul>';
+  closeList();
   return out;
 }
 
@@ -115,11 +135,15 @@ function renderMessages(messages) {
   for (const msg of lastMessages) {
     const wrap = document.createElement('div');
     wrap.className = `message ${msg.role === 'user' ? 'user' : msg.role === 'assistant' ? 'assistant' : 'error'}`;
+    if (msg.role === 'assistant' && msg.chart?.points?.length) wrap.classList.add('has-chart');
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     bubble.setAttribute('dir', 'auto');
     bubble.innerHTML = msg.role === 'user' ? escapeHtml(msg.content) : renderAnswer(msg.content);
     wrap.appendChild(bubble);
+    if (msg.role === 'assistant' && msg.chart?.points?.length) {
+      wrap.appendChild(renderChatChart(msg.chart));
+    }
     if (msg.analysis_mode) {
       const meta = document.createElement('div');
       meta.className = 'meta-line';
@@ -257,17 +281,12 @@ function renderHealth(payload) {
   `).join('');
 }
 
-function renderTrend(payload) {
-  const data = payload.trend || [];
-  const box = $('trendChart');
-  if (!data.length) {
-    box.innerHTML = `<div class="empty-state">${escapeHtml(t('trend.none'))}</div>`;
-    return;
-  }
-  const currency = payload.filters?.currency || 'USD';
+function buildTrendChartHtml(data, currency, ariaLabel) {
+  const chartData = (data || []).filter(point => point && Number.isFinite(Number(point.value)));
+  if (!chartData.length) return '';
   const width = 980, height = 260;
   const padLeft = 48, padRight = 18, padTop = 18, padBottom = 34;
-  const values = data.map(d => Number(d.value || 0));
+  const values = chartData.map(d => Number(d.value));
   const minRaw = Math.min(...values);
   const maxRaw = Math.max(...values);
   const min = Math.min(minRaw, 0);
@@ -276,29 +295,63 @@ function renderTrend(payload) {
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
-  const x = (i) => padLeft + (data.length === 1 ? plotW / 2 : i * plotW / (data.length - 1));
+  const x = (i) => padLeft + (chartData.length === 1 ? plotW / 2 : i * plotW / (chartData.length - 1));
   const y = (v) => padTop + (max - v) / range * plotH;
-  const points = data.map((d, i) => ({ x: x(i), y: y(Number(d.value || 0)), d }));
+  const points = chartData.map((d, i) => ({ x: x(i), y: y(Number(d.value)), d }));
   const line = points.map(p => `${p.x},${p.y}`).join(' ');
   const baselineY = y(0);
   const area = `${padLeft},${baselineY} ${points.map(p => `${p.x},${p.y}`).join(' ')} ${width - padRight},${baselineY}`;
   const gridVals = [max, (max + min) / 2, min];
+  const gradientId = `areaGradient-${++chartSvgSequence}`;
 
-  box.innerHTML = `
-    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(t('trend.aria'))}">
+  return `
+    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(ariaLabel)}">
       <defs>
-        <linearGradient id="areaGradient" x1="0" x2="0" y1="0" y2="1">
+        <linearGradient id="${gradientId}" x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" style="stop-color:var(--accent)" stop-opacity=".35"/>
           <stop offset="100%" style="stop-color:var(--accent)" stop-opacity="0"/>
         </linearGradient>
       </defs>
       ${gridVals.map(v => `<line class="chart-gridline ${Math.abs(v) < 1e-9 ? 'chart-zero' : ''}" x1="${padLeft}" x2="${width - padRight}" y1="${y(v)}" y2="${y(v)}"/><text class="chart-axis-label" x="5" y="${y(v) + 3}">${formatNumber(v, 0)}</text>`).join('')}
-      <polygon class="chart-area" points="${area}"/>
+      <polygon class="chart-area" points="${area}" style="fill:url(#${gradientId})"/>
       <polyline class="chart-line" points="${line}"/>
       ${points.map(p => `<circle class="chart-point" cx="${p.x}" cy="${p.y}" r="4.2"><title>${escapeHtml(p.d.period)} · ${escapeHtml(formatMoney(p.d.value, currency))}</title></circle><text class="chart-axis-label" x="${p.x}" y="${height - 9}" text-anchor="middle">${escapeHtml(p.d.period)}</text>`).join('')}
     </svg>
     <div class="chart-note"><span>${escapeHtml(t('trend.low', { v: formatMoney(minRaw, currency) }))}</span><span>${escapeHtml(t('trend.high', { v: formatMoney(maxRaw, currency) }))}</span></div>
   `;
+}
+
+function renderTrend(payload) {
+  const data = payload.trend || [];
+  const box = $('trendChart');
+  const currency = payload.filters?.currency || 'USD';
+  if (!data.length) {
+    box.innerHTML = `<div class="empty-state">${escapeHtml(t('trend.none'))}</div>`;
+    return;
+  }
+  box.innerHTML = buildTrendChartHtml(data, currency, t('trend.aria'));
+}
+
+function renderChatChart(chart) {
+  const card = document.createElement('section');
+  card.className = 'chat-chart-card';
+  card.setAttribute('dir', 'auto');
+  const currency = String(chart.currency || '').toUpperCase();
+  const points = (chart.points || []).filter(point => point && Number.isFinite(Number(point.value)));
+  const title = chart.title || `${chart.metric || t('trend.title')} · ${currency}`;
+  const arabic = window.I18N.lang === 'ar';
+  const actualVerified = chart.status === 'success' && chart.data_quality?.actual_data === true;
+  const source = actualVerified
+    ? `${arabic ? 'بيانات فعلية موثّقة' : 'Verified actuals'} · ${escapeHtml(chart.source_tool || 'financial analytics')}`
+    : escapeHtml(chart.source_tool || 'financial analytics');
+  const ariaLabel = `${title} (${currency})`;
+  const tableRows = points.map(point => `<tr><td dir="ltr">${escapeHtml(point.period)}</td><td dir="ltr">${escapeHtml(formatMoney(point.value, currency))}</td></tr>`).join('');
+  card.innerHTML = `
+    <div class="chat-chart-header"><div><div class="chat-chart-title">${escapeHtml(title)}</div><div class="chat-chart-source">${source}</div></div><span class="tiny-badge" dir="ltr">${escapeHtml(currency)}</span></div>
+    <div class="chat-chart-plot">${buildTrendChartHtml(points, currency, ariaLabel)}</div>
+    <details class="chat-chart-data"><summary>${escapeHtml(arabic ? 'عرض البيانات' : 'View data')}</summary><table><thead><tr><th>${escapeHtml(arabic ? 'الشهر' : 'Month')}</th><th>${escapeHtml(arabic ? 'القيمة' : 'Value')}</th></tr></thead><tbody>${tableRows}</tbody></table></details>
+  `;
+  return card;
 }
 
 function renderDrivers(payload) {
