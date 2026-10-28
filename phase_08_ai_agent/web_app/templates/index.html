@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en" dir="ltr" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Finance Analyst — Executive Dashboard</title>
+  <!-- Apply saved theme / language before first paint (prevents flash) -->
+  <script>
+    (function () {
+      try {
+        var root = document.documentElement;
+        var theme = localStorage.getItem('af_theme');
+        if (!theme) theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+        var lang = localStorage.getItem('af_lang') || 'en';
+        root.setAttribute('data-theme', theme);
+        root.setAttribute('lang', lang);
+        root.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><span>AF</span></div>
+        <div>
+          <div class="brand-title" data-i18n="brand.title">AI Finance</div>
+          <div class="brand-subtitle" data-i18n="brand.subtitle">Executive Copilot</div>
+        </div>
+      </div>
+
+      <button class="new-analysis" id="newAnalysisBtn" data-i18n="nav.newAnalysis">＋ New analysis</button>
+
+      <div class="side-section">
+        <div class="section-label" data-i18n="nav.workspace">Workspace</div>
+        <button class="nav-item active" data-view="overview" data-i18n="nav.overview">◉ Overview</button>
+        <button class="nav-item" data-view="trend" data-i18n="nav.trend">⌁ Cash flow trend</button>
+        <button class="nav-item" data-view="drivers" data-i18n="nav.drivers">↗ Drivers</button>
+        <button class="nav-item" data-view="risk" data-i18n="nav.risk">⚠ Risk & anomalies</button>
+        <button class="nav-item" data-view="forecast" data-i18n="nav.forecast">◎ Forecast</button>
+      </div>
+
+      <div class="side-section compact">
+        <div class="section-label" data-i18n="side.boundary">Verified boundary</div>
+        <div class="boundary-card">
+          <div class="status-dot"></div>
+          <div>
+            <div class="boundary-title" data-i18n="side.actualConnected">Actual data connected</div>
+            <div class="boundary-range" id="boundaryRange" dir="ltr">…</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="side-section compact">
+        <div class="section-label" data-i18n="side.engine">Engine</div>
+        <div class="engine-row"><span data-i18n="side.provider">Provider</span><strong id="providerName">Google</strong></div>
+        <div class="engine-row"><span data-i18n="side.model">Model</span><strong id="modelName">…</strong></div>
+        <div class="engine-row"><span data-i18n="side.turn">Turn</span><strong id="turnNumber">0</strong></div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="ghost-btn" id="showLogsBtn" data-i18n="side.viewLog">View execution log</button>
+        <button class="ghost-btn danger" id="resetBtn" data-i18n="side.clear">Clear context</button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow" data-i18n="top.eyebrow">FINANCIAL INTELLIGENCE · EXECUTIVE WORKSPACE</div>
+          <h1 data-i18n="top.title">See the numbers. Ask why. Act with context.</h1>
+          <div class="topbar-subtitle" data-i18n="top.subtitle">Verified analytics, deterministic calculations, and Gemini-powered financial narrative.</div>
+        </div>
+        <div class="top-actions">
+          <div class="pref-group">
+            <button class="pref-btn" id="langBtn" type="button" data-i18n-title="pref.langTitle" title="Switch language">
+              <span class="pref-icon">🌐</span><span id="langBtnLabel">العربية</span>
+            </button>
+            <button class="pref-btn" id="themeBtn" type="button" data-i18n-title="pref.themeTitle" title="Switch theme">
+              <span class="pref-icon" id="themeIcon">☀</span><span id="themeBtnLabel">Light</span>
+            </button>
+          </div>
+          <div class="live-pill"><span class="status-dot"></span> <span data-i18n="top.live">Live analytical session</span></div>
+          <button class="icon-btn" id="refreshDashboardBtn" data-i18n-title="top.refresh" title="Refresh dashboard">↻</button>
+        </div>
+      </header>
+
+      <section class="filter-bar">
+        <div class="filter-group">
+          <label for="currencySelect" data-i18n="filter.currency">Currency</label>
+          <select id="currencySelect">
+            <option>USD</option>
+            <option>EUR</option>
+            <option>GBP</option>
+            <option>CAD</option>
+            <option>JPY</option>
+            <option>AUD</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label for="monthSelect" data-i18n="filter.month">Analysis month</label>
+          <input id="monthSelect" type="month" />
+        </div>
+        <div class="filter-group wide">
+          <label data-i18n="filter.window">Trend window</label>
+          <div class="segmented" id="trendSelector">
+            <button data-months="3" data-i18n="filter.m3">3M</button>
+            <button data-months="6" class="active" data-i18n="filter.m6">6M</button>
+            <button data-months="12" data-i18n="filter.m12">12M</button>
+          </div>
+        </div>
+        <button class="apply-filter" id="applyFilterBtn" data-i18n="filter.apply">Apply filters</button>
+        <div class="filter-status" id="filterStatus" data-i18n="filter.latest">Latest actual period</div>
+      </section>
+
+      <section class="hero-summary">
+        <div class="summary-copy">
+          <div class="tiny-label" data-i18n="hero.selected">SELECTED PERIOD</div>
+          <div class="summary-period" id="selectedPeriodLabel">…</div>
+          <div class="summary-description" id="selectedPeriodDescription" data-i18n="hero.preparing">Preparing your executive dashboard from verified actual data.</div>
+        </div>
+        <div class="summary-chips">
+          <span class="chip" id="scopeChip">Actual</span>
+          <span class="chip" id="modeChip">Dashboard</span>
+          <span class="chip" id="currencyChip">USD</span>
+        </div>
+      </section>
+
+      <section class="kpi-grid-large" id="kpiGrid">
+        <div class="loading-tile"></div>
+        <div class="loading-tile"></div>
+        <div class="loading-tile"></div>
+        <div class="loading-tile"></div>
+        <div class="loading-tile"></div>
+        <div class="loading-tile"></div>
+      </section>
+
+      <section class="dashboard-grid top-row">
+        <section class="panel trend-panel" data-panel="trend">
+          <div class="panel-header">
+            <div>
+              <div class="card-title" data-i18n="trend.title">Net cash flow trend</div>
+              <div class="card-subtitle" id="trendSubtitle" data-i18n="trend.subtitle">Monthly verified actuals</div>
+            </div>
+            <div class="panel-actions"><span class="tiny-badge" id="trendRangeBadge">6</span></div>
+          </div>
+          <div class="chart-wrap" id="trendChart"></div>
+        </section>
+
+        <section class="panel health-panel" data-panel="overview">
+          <div class="panel-header">
+            <div>
+              <div class="card-title" data-i18n="health.title">Financial health signals</div>
+              <div class="card-subtitle" data-i18n="health.subtitle">Observed indicators — no artificial score</div>
+            </div>
+            <span class="tiny-badge" data-i18n="health.badge">Evidence-based</span>
+          </div>
+          <div class="health-grid" id="healthGrid"></div>
+        </section>
+      </section>
+
+      <section class="dashboard-grid middle-row">
+        <section class="panel drivers-panel" data-panel="drivers">
+          <div class="panel-header">
+            <div>
+              <div class="card-title" data-i18n="drivers.title">Cash flow drivers</div>
+              <div class="card-subtitle" id="driversSubtitle" data-i18n="drivers.subtitle">Current month vs previous month</div>
+            </div>
+            <span class="tiny-badge" id="driverBadge" data-i18n="drivers.badge">Top contributors</span>
+          </div>
+          <div class="drivers-body" id="driversList"></div>
+        </section>
+
+        <section class="panel comparison-panel" data-panel="overview">
+          <div class="panel-header">
+            <div>
+              <div class="card-title" data-i18n="cmp.title">Month-over-month movement</div>
+              <div class="card-subtitle" data-i18n="cmp.subtitle">Current selected month vs previous month</div>
+            </div>
+            <span class="tiny-badge" id="comparisonDirection">—</span>
+          </div>
+          <div class="comparison-body" id="comparisonDetails"></div>
+        </section>
+      </section>
+
+      <section class="dashboard-grid bottom-row">
+        <section class="panel risk-panel" data-panel="risk">
+          <div class="panel-header">
+            <div>
+              <div class="card-title" data-i18n="risk.title">Risk & anomalies</div>
+              <div class="card-subtitle" data-i18n="risk.subtitle">Modified Z-score · threshold 3.5</div>
+            </div>
+            <span class="tiny-badge" id="anomalyBadge">0</span>
+          </div>
+          <div class="risk-body" id="riskDetails"></div>
+        </section>
+
+        <section class="panel forecast-panel" data-panel="forecast">
+          <div class="panel-header">
+            <div>
+              <div class="card-title" data-i18n="fc.title">Forecast outlook</div>
+              <div class="card-subtitle" data-i18n="fc.subtitle">Explicit projection from completed monthly history</div>
+            </div>
+            <span class="tiny-badge" data-i18n="fc.badge">Forecast</span>
+          </div>
+          <div class="forecast-body" id="forecastDetails"></div>
+        </section>
+      </section>
+
+      <section class="panel chat-card" id="copilotPanel">
+        <div class="chat-header">
+          <div>
+            <div class="card-title" data-i18n="chat.title">AI Finance Copilot</div>
+            <div class="card-subtitle" id="analysisModeLabel">Context-aware conversation over verified financial data</div>
+          </div>
+          <div class="chat-actions">
+            <button class="mini-btn" id="suggestionsBtn" style="width:auto;padding:0 11px;font-size:10px" data-i18n="chat.suggestions">Suggestions</button>
+            <button class="mini-btn" id="scrollBottomBtn">↓</button>
+          </div>
+        </div>
+
+        <div class="suggestion-strip" id="suggestionStrip">
+          <button class="suggestion"></button>
+          <button class="suggestion"></button>
+          <button class="suggestion"></button>
+          <button class="suggestion"></button>
+        </div>
+
+        <div class="chat-feed" id="chatFeed"></div>
+        <div class="composer-wrap">
+          <div class="composer">
+            <textarea id="questionInput" dir="auto" rows="2" data-i18n-placeholder="chat.placeholder" placeholder="Ask about cash flow, trends, drivers, anomalies, ratios, forecasts…"></textarea>
+            <button class="send-btn" id="sendBtn"><span data-i18n="chat.send">Send</span> <span>↵</span></button>
+          </div>
+          <div class="composer-hint" data-i18n="chat.hint">Ctrl + Enter to send · Follow-ups preserve verified context · Dashboard filters are independent from chat context</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal hidden" id="logModal">
+    <div class="modal-backdrop" id="logBackdrop"></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <div class="card-title" data-i18n="log.title">Execution log</div>
+          <div class="card-subtitle" data-i18n="log.subtitle">Tool routing, deterministic arguments, and validation trace</div>
+        </div>
+        <button class="mini-btn" id="closeLogBtn">×</button>
+      </div>
+      <pre id="logContent"></pre>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="{{ url_for('static', path='i18n.js') }}"></script>
+  <script src="{{ url_for('static', path='app.js') }}"></script>
+</body>
+</html>

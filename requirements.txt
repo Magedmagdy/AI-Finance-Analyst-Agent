@@ -1,0 +1,23 @@
+# ==========================================
+# AI Finance Analyst Agent
+# Core Environment
+# ==========================================
+
+# Data Processing
+pandas
+numpy
+pyarrow
+
+# Hugging Face
+huggingface_hub
+
+# Jupyter
+jupyter
+ipykernel
+
+# SQL Server
+pyodbc
+SQLAlchemy
+
+# Environment Variables
+python-dotenv

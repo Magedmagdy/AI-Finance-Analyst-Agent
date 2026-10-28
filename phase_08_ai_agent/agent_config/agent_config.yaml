@@ -1,0 +1,54 @@
+agent:
+  name: "AI Finance Analyst"
+  version: "1.0.0"
+  description: "AI agent for financial and business analysis using verified enterprise data."
+
+  environment: "development"
+
+  behavior:
+    data_first: true
+    never_fabricate: true
+    require_verified_data: true
+    read_only_database: true
+    validate_tool_results: true
+    separate_fact_from_interpretation: true
+    identify_forecast_as_forecast: true
+    identify_partial_periods: true
+
+  response:
+    default_currency: "EGP"
+    include_period: true
+    include_data_scope: true
+    include_data_quality: true
+    concise_for_simple_questions: true
+    detailed_for_complex_questions: true
+
+  tools:
+    enabled:
+      - "get_financial_kpis"
+      - "compare_financial_periods"
+      - "analyze_financial_trend"
+      - "detect_financial_anomalies"
+      - "analyze_cash_flow_drivers"
+      - "forecast_financial_kpi"
+      - "analyze_financial_ratios"
+
+    disabled: []
+
+  security:
+    allow_write_sql: false
+    allow_schema_changes: false
+    allow_admin_commands: false
+    expose_credentials: false
+
+  limits:
+    max_tool_calls_per_request: 10
+    max_sql_rows: 10000
+    sql_timeout_seconds: 120
+
+  logging:
+    enabled: true
+    log_tool_calls: true
+    log_errors: true
+    log_user_questions: true
+    log_sensitive_data: false

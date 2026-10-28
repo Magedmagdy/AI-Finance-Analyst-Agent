@@ -1,0 +1,296 @@
+
+{
+  "version": "6.0",
+  "tools": [
+    {
+      "name": "get_financial_kpis",
+      "description": "Returns verified banking financial KPIs from AI_Finance SQL Server for one requested period. Use this tool for inflows, outflows, net cash flow, fees, refunds, transfers, transaction counts, active accounts, and average transaction amount. Keep currencies separate. date_to is inclusive.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "date_from": {
+            "type": "string",
+            "description": "Start date in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to": {
+            "type": "string",
+            "description": "End date in YYYY-MM-DD format. Inclusive. Example: July 2026 ends on 2026-07-31."
+          },
+          "metrics": {
+            "type": "array",
+            "description": "Requested KPI names. Examples: total_inflows, total_outflows, net_cash_flow, fees, refunds, transfers, transactions, completed_transactions, pending_transactions, failed_transactions, reversed_transactions, active_accounts, average_transaction_amount.",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional currency filter.",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP",
+              "CAD",
+              "JPY",
+              "AUD"
+            ]
+          }
+        },
+        "required": [
+          "date_from",
+          "date_to",
+          "metrics"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "compare_financial_periods",
+      "description": "Compares one verified banking financial KPI between two periods. Use this tool when the user asks to compare periods, calculate change, variance, percentage change, increase, decrease, or month-over-month change. Results remain separated by currency.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "date_from_1": {
+            "type": "string",
+            "description": "Start date of period 1 in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to_1": {
+            "type": "string",
+            "description": "End date of period 1 in YYYY-MM-DD format. Inclusive."
+          },
+          "date_from_2": {
+            "type": "string",
+            "description": "Start date of period 2 in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to_2": {
+            "type": "string",
+            "description": "End date of period 2 in YYYY-MM-DD format. Inclusive."
+          },
+          "metric": {
+            "type": "string",
+            "description": "Financial KPI to compare. Examples: net_cash_flow, total_inflows, total_outflows, fees, refunds, transfers, transactions, active_accounts, average_transaction_amount."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional currency filter.",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP",
+              "CAD",
+              "JPY",
+              "AUD"
+            ]
+          }
+        },
+        "required": [
+          "date_from_1",
+          "date_to_1",
+          "date_from_2",
+          "date_to_2",
+          "metric"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "analyze_financial_trend",
+      "description": "Analyzes the monthly trend of one verified banking financial KPI across a requested date range. Use this tool for trend analysis, monthly movement, month-over-month behavior, or questions about how a KPI evolved over several months. Results remain separated by currency.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "date_from": {
+            "type": "string",
+            "description": "Start date in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to": {
+            "type": "string",
+            "description": "End date in YYYY-MM-DD format. Inclusive."
+          },
+          "metric": {
+            "type": "string",
+            "description": "Financial KPI to trend. Examples: net_cash_flow, total_inflows, total_outflows, fees, refunds, transfers, transactions, active_accounts, average_transaction_amount."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional currency filter.",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP",
+              "CAD",
+              "JPY",
+              "AUD"
+            ]
+          }
+        },
+        "required": [
+          "date_from",
+          "date_to",
+          "metric"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "detect_financial_anomalies",
+      "description": "Detects unusual daily values of a verified banking financial KPI using a Modified Z-Score method. Use this tool for unusual values, abnormal movements, outliers, or anomalous days. Detection is performed separately by currency.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "date_from": {
+            "type": "string",
+            "description": "Start date in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to": {
+            "type": "string",
+            "description": "End date in YYYY-MM-DD format. Inclusive."
+          },
+          "metric": {
+            "type": "string",
+            "description": "KPI to analyze for anomalies. Examples: net_cash_flow, total_outflows, total_inflows, fees, refunds, transfers, transactions, active_accounts, average_transaction_amount."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional currency filter.",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP",
+              "CAD",
+              "JPY",
+              "AUD"
+            ]
+          },
+          "threshold": {
+            "type": "number",
+            "description": "Modified Z-Score threshold. Default is 3.5."
+          }
+        },
+        "required": [
+          "date_from",
+          "date_to",
+          "metric"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "analyze_cash_flow_drivers",
+      "description": "Analyzes the drivers of net cash-flow change between two periods using verified completed banking transactions. Shows period values, changes, and contribution percentages by transaction type. Use this tool when the user asks why net cash flow changed or what transaction types drove the change. Currency is analyzed separately.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "date_from_1": {
+            "type": "string",
+            "description": "Start date of period 1 in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to_1": {
+            "type": "string",
+            "description": "End date of period 1 in YYYY-MM-DD format. Inclusive."
+          },
+          "date_from_2": {
+            "type": "string",
+            "description": "Start date of period 2 in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to_2": {
+            "type": "string",
+            "description": "End date of period 2 in YYYY-MM-DD format. Inclusive."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional currency filter.",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP",
+              "CAD",
+              "JPY",
+              "AUD"
+            ]
+          }
+        },
+        "required": [
+          "date_from_1",
+          "date_to_1",
+          "date_from_2",
+          "date_to_2"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "forecast_financial_kpi",
+      "description": "Forecasts the next monthly value of a verified banking financial KPI using a trailing moving average of the latest completed months. Use this tool when the user asks for a forecast, projection, expected next month value, or future KPI. Forecasts must be clearly labeled as forecasts and remain separated by currency.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "date_from": {
+            "type": "string",
+            "description": "Start date of the historical period in YYYY-MM-DD format. Inclusive."
+          },
+          "date_to": {
+            "type": "string",
+            "description": "End date of the historical period in YYYY-MM-DD format. Inclusive."
+          },
+          "metric": {
+            "type": "string",
+            "description": "KPI to forecast. Examples: net_cash_flow, total_inflows, total_outflows, fees, refunds, transfers, transactions, active_accounts, average_transaction_amount."
+          },
+          "currency": {
+            "type": "string",
+            "description": "Optional currency filter.",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP",
+              "CAD",
+              "JPY",
+              "AUD"
+            ]
+          },
+          "lookback_months": {
+            "type": "integer",
+            "description": "Number of latest completed months used in the moving-average forecast. Default is 3.",
+            "minimum": 1,
+            "maximum": 24
+          }
+        },
+        "required": [
+          "date_from",
+          "date_to",
+          "metric"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "analyze_financial_ratios",
+      "description": "Calculate derived financial ratios for a specified currency and period using verified transaction data.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "currency": {
+            "type": "string",
+            "description": "Three-letter currency code such as USD, EUR, GBP, CAD, JPY, or AUD."
+          },
+          "date_from": {
+            "type": "string",
+            "description": "Start date in YYYY-MM-DD format."
+          },
+          "date_to": {
+            "type": "string",
+            "description": "End date in YYYY-MM-DD format, inclusive."
+          }
+        },
+        "required": [
+          "currency",
+          "date_from",
+          "date_to"
+        ]
+      }
+    }
+  ]
+}

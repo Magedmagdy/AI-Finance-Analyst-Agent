@@ -1,0 +1,20 @@
+model:
+  provider: "google"
+  name: "gemini-3.5-flash-lite"
+  api: "gemini"
+
+  parameters:
+    max_output_tokens: 2500
+
+  behavior:
+    enable_tool_calling: true
+    parallel_tool_calls: false
+
+  retry:
+    max_attempts: 3
+    retry_on:
+      - "timeout"
+      - "temporary_error"
+      - "service_unavailable"
+
+  timeout_seconds: 60
